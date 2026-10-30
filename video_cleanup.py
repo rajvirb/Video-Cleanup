@@ -82,6 +82,9 @@ ALBUM_DUPES = "Video Cleanup - Reviewable Photos"
 COMPRESS_DIR = Path.home() / "Movies" / "Video Cleanup" / "Compressed"
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp", ".mts", ".webm"}
 CACHE_FILE = Path.home() / ".cache" / "video-cleanup" / "hashes.json"
+# Set by the Mac app (app.py): questions and progress are sent to the app's window
+# as "@@{json}" lines on stdout, and the answers come back on stdin.
+GUI = os.environ.get("VIDEO_CLEANUP_GUI") == "1"
 
 
 # ---------------------------------------------------------------- model
@@ -138,7 +141,14 @@ def human_dur(s: float) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+def gui_send(kind: str, **data) -> None:
+    print("@@" + json.dumps({"kind": kind, **data}), flush=True)
+
+
 def progress(label: str, i: int, n: int) -> None:
+    if GUI:
+        gui_send("progress", label=label, i=i, n=n)
+        return
     if not sys.stdout.isatty():
         if i == n:
             print(f"  {label}: {n}/{n}")
@@ -153,8 +163,10 @@ def progress(label: str, i: int, n: int) -> None:
 
 def ffmpeg_exe() -> str:
     found = shutil.which("ffmpeg")
-    if found:
-        return found
+    # apps opened from Finder don't have Homebrew's folders on their PATH
+    for p in (found, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if p and os.path.exists(p):
+            return p
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -431,7 +443,7 @@ def fingerprint_all(videos: list[Video], ff: str, download_missing: bool) -> Non
 
     if remote:
         print(f"Downloading {len(remote)} iCloud-only videos one at a time to check them…")
-        print("  (each is deleted again straight after; press Ctrl-C to stop and use what's done)")
+        print(f"  (each is deleted again straight after; press {'Stop' if GUI else 'Ctrl-C'} to stop and use what's done)")
         try:
             for i, v in enumerate(remote, 1):
                 with tempfile.TemporaryDirectory() as td:
@@ -925,6 +937,21 @@ def pick_encoder(ff: str) -> str | None:
 
 
 def encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple[bool, str]:
+    """Encode to a temporary name and only rename it to dst once it's complete and
+    checked, so stopping part-way never leaves a half-written copy that a later
+    run would take for a finished one."""
+    part = dst + ".partial"
+    try:
+        ok, why = _encode_hevc(ff, encoder, src, part, plan)
+        if ok:
+            os.replace(part, dst)
+        return ok, why
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def _encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple[bool, str]:
     info = probe_stream(ff, src)
     short = min(info["width"], info["height"]) or plan.short_side
     vf = []
@@ -1128,7 +1155,15 @@ def make_albums(videos: list[Video], groups: list[Group]) -> bool:
     return True
 
 # ---------------------------------------------------------------- main
-def ask_choice(question: str, options: tuple[str, ...], default: str) -> str:
+def ask_choice(question: str, options: tuple[str, ...], default: str,
+               labels: tuple[str, ...] | None = None) -> str:
+    """Ask for one of options. labels are the button names the Mac app shows."""
+    if GUI:
+        labels = labels or options
+        gui_send("ask", question=question, buttons=list(labels),
+                 default=labels[options.index(default)])
+        ans = sys.stdin.readline().strip()
+        return options[labels.index(ans)] if ans in labels else default
     if not sys.stdin.isatty():
         return default
     while True:
@@ -1141,6 +1176,10 @@ def ask_choice(question: str, options: tuple[str, ...], default: str) -> str:
 
 
 def ask(question: str, default: bool = False) -> bool:
+    if GUI:
+        gui_send("ask", question=question, buttons=["Yes", "No"], default="Yes" if default else "No")
+        ans = sys.stdin.readline().strip()
+        return default if not ans else ans == "Yes"
     if not sys.stdin.isatty():
         return default
     hint = "[Y/n]" if default else "[y/N]"
@@ -1185,9 +1224,14 @@ def main() -> None:
         except Exception as exc:
             msg = str(exc)
             print(f"\nCouldn't read the Photos library: {msg}")
-            if "permission" in msg.lower() or "operation not permitted" in msg.lower() or "authoriz" in msg.lower():
-                print("Give Terminal 'Full Disk Access' in System Settings › Privacy & Security, "
-                      "then quit and reopen Terminal and try again.")
+            # without Full Disk Access, osxphotos usually fails copying Photos.sqlite
+            if any(k in msg.lower() for k in ("permission", "operation not permitted",
+                                               "authoriz", "error copying")):
+                if GUI:
+                    gui_send("full_disk_access")
+                else:
+                    print("Give Terminal 'Full Disk Access' in System Settings › Privacy & Security, "
+                          "then quit and reopen Terminal and try again.")
             sys.exit(1)
         source = "Photos library"
     # else:
@@ -1224,7 +1268,8 @@ def main() -> None:
         if want is None:
             want = ask("Create review albums in Photos so you can check and delete these on your iPhone?", True)
         if want:
-            print("Adding albums in Photos (Photos will open; allow Terminal to control it if asked)…")
+            print("Adding albums in Photos (Photos will open; allow "
+                  f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
             try:
                 albums_made = make_albums(videos, groups)
             except Exception as exc:
@@ -1249,14 +1294,16 @@ def main() -> None:
         s_hd = sum(p.saving(videos[i]) for i, p in hd)
         print("\nVideos that could be made smaller:")
         if same:
-            print(f"  [s] {plural(len(same), 'video')} re-saved in the newer HEVC format at the same resolution: "
+            print(f"  {'' if GUI else '[s] '}{plural(len(same), 'video')} re-saved in the newer HEVC format at the same resolution: "
                   f"saves about {human_size(s_same)}, with no visible difference.")
         if hd:
-            print(f"  [h] {plural(len(hd), 'video')} re-saved as HEVC and capped at 1080p: saves about {human_size(s_hd)}. "
+            print(f"  {'' if GUI else '[h] '}{plural(len(hd), 'video')} re-saved as HEVC and capped at 1080p: saves about {human_size(s_hd)}. "
                   "Fine on a phone or laptop, a little less sharp on a big 4K TV.")
         choice = args.compress
         if choice is None:
-            choice = ask_choice("Make smaller copies? Type s, h, or n for no", ("s", "h", "n"), "n")
+            choice = ask_choice("Make smaller copies?" if GUI else
+                                "Make smaller copies? Type s, h, or n for no", ("s", "h", "n"), "n",
+                                ("Same resolution", "Cap at 1080p", "No thanks"))
             choice = {"s": "same", "h": "1080p", "n": "no"}[choice]
         items = same if choice == "same" else hd if choice == "1080p" else []
         if items:
