@@ -1,16 +1,41 @@
 # PyInstaller recipe for "Video Cleanup.app". Build it with ./build_app.sh
-from importlib.util import find_spec
+from importlib.metadata import PackageNotFoundError, distribution, packages_distributions
 
+from packaging.requirements import Requirement
 from PyInstaller.utils.hooks import collect_all
 
+
+def with_dependencies(*names: str) -> set[str]:
+    """These distributions and everything they depend on, by name."""
+    seen: set[str] = set()
+    todo = list(names)
+    while todo:
+        name = todo.pop().lower().replace("_", "-")
+        if name in seen:
+            continue
+        try:
+            dist = distribution(name)
+        except PackageNotFoundError:
+            continue
+        seen.add(name)
+        for spec in dist.requires or []:
+            req = Requirement(spec)
+            if req.marker is None or req.marker.evaluate({"extra": ""}):
+                todo.append(req.name)
+    return seen
+
+
+# osxphotos and many of the packages it uses load parts of themselves (and data
+# files) at run time, out of sight of PyInstaller, so include them all in full.
+# imageio_ffmpeg carries the ffmpeg program as a data file.
+wanted = with_dependencies("osxphotos", "imageio-ffmpeg")
+modules = sorted({mod for mod, dists in packages_distributions().items()
+                  if any(d.lower().replace("_", "-") in wanted for d in dists)
+                  and mod.isidentifier()})
+
 datas, binaries, hiddenimports = [], [], ["video_cleanup"]
-# osxphotos and photoscript load parts of themselves (and their AppleScript
-# files) at run time; imageio_ffmpeg carries the ffmpeg program as a data file;
-# the rest are osxphotos dependencies that read data files of their own
-for pkg in ("osxphotos", "photoscript", "imageio_ffmpeg", "utitools", "tzdata", "osxmetadata"):
-    if not find_spec(pkg):
-        continue
-    d, b, h = collect_all(pkg)
+for mod in modules:
+    d, b, h = collect_all(mod)
     datas += d
     binaries += b
     hiddenimports += h
