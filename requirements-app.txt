@@ -1,0 +1,6 @@
+# Packages bundled into the Mac app (see build_app.sh)
+pyinstaller>=6.10
+osxphotos>=0.70
+numpy>=2.0
+pillow>=10
+imageio-ffmpeg>=0.5

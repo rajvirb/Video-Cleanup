@@ -1,0 +1,30 @@
+# Builds the Mac app on GitHub's Macs. Download it from the run's "Artifacts",
+# or push a tag like v1.0.0 to publish it as a release anyone can download.
+name: Build Mac app
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest       # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build and check the app
+        run: ./build_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Video Cleanup (Apple Silicon)
+          path: dist/Video Cleanup.zip
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "dist/Video Cleanup.zip" --title "Video Cleanup $GITHUB_REF_NAME" --generate-notes
