@@ -12,7 +12,7 @@
 Video Cleanup — find duplicate and space-wasting videos in your Photos library.
 
 It only READS your library. It never deletes anything. It writes an HTML report
-and, if you agree, adds suggested videos to review albums in Photos so you can
+and, if you agree, adds the duplicates it finds to an album in Photos so you can
 check them and delete them yourself (on your Mac or iPhone).
 
 What it finds
@@ -73,12 +73,10 @@ MIN_INFORMATIVE = 3      # need this many non-blank frames to compare by content
 POSTER_MATCH_BITS = 6    # poster-frame match for videos we can't open (iCloud-only)
 SHORT_CLIP_SECS = 3.0
 BIGGEST_COUNT = 40
-ALBUM_DELETE = "Video Cleanup – Suggested to delete"
-ALBUM_REVIEW = "Video Cleanup – Look-alikes to review"
-ALBUM_BIG = "Video Cleanup – Biggest videos"
-ALBUM_COMPARE = "Video Cleanup – Originals and smaller copies"
-ALBUM_ORIGINALS = "Video Cleanup – Originals that now have a smaller copy"
-ALBUM_DUPES = "Video Cleanup - Reviewable Photos"
+ALBUM_DUPES = "Video Cleanup - Duplicated & Trimmed Videos"        # every video in a duplicate set
+ALBUM_ORIGINALS = "Video Cleanup - Original Videos"              # originals that now have a smaller copy
+ALBUM_COMPRESSED = "Video Cleanup - Compressed Versions"         # the smaller copies
+ALBUM_COMPARE = "Video Cleanup - Original & Compressed Comparison"  # each original next to its copy
 COMPRESS_DIR = Path.home() / "Movies" / "Video Cleanup" / "Compressed"
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp", ".mts", ".webm"}
 CACHE_FILE = Path.home() / ".cache" / "video-cleanup" / "hashes.json"
@@ -706,7 +704,8 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
           <i>{html.escape(cr['dir'])}</i>, named “… - smaller” and “… - original”, so you can compare them.""" +
           (f""" {cr['imported']} were imported into Photos with their dates, places, favourites and albums.
           The album <i>{html.escape(ALBUM_COMPARE)}</i> has each original right next to its smaller copy,
-          so you can compare them. When you're happy, open <i>{html.escape(ALBUM_ORIGINALS)}</i>,
+          so you can compare them, and <i>{html.escape(ALBUM_COMPRESSED)}</i> has just the smaller copies.
+          When you're happy, open <i>{html.escape(ALBUM_ORIGINALS)}</i>,
           select all and delete the originals, then empty Recently Deleted. Photos may list each pair
           under Duplicates. Don't press Merge there, because it keeps the larger original.""" if cr['imported'] else
            " Drag them into Photos if you want them in your library.") + "</div>")
@@ -740,13 +739,13 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
             return ""
         return f"{human_size(v.size / (v.duration / 60))} per minute"
 
-    albums_note = (f"""<div class="callout"><b>Albums added in Photos.</b> Look for
-      <i>{html.escape(ALBUM_DELETE)}</i>, <i>{html.escape(ALBUM_REVIEW)}</i> and
-      <i>{html.escape(ALBUM_BIG)}</i> under Albums on your Mac or iPhone. Open one, check the
-      videos, then select them and choose <b>Delete</b> (not “Remove from Album”).
+    albums_note = (f"""<div class="callout"><b>Album added in Photos.</b> Look for
+      <i>{html.escape(ALBUM_DUPES)}</i> under Albums on your Mac or iPhone. It has every video
+      from the sets below, set by set, with the one marked Keep first. Check them, select the
+      ones you don't want and choose <b>Delete</b> (not “Remove from Album”).
       Then empty <b>Recently Deleted</b> to free the iCloud space.</div>""" if albums_made else
                    """<div class="callout">Tip: run the tool again and answer <b>yes</b> to
-      “create review albums” to get these videos collected in albums you can open on your iPhone.</div>""" if from_photos else "")
+      “create an album in Photos” to get these videos collected in an album you can open on your iPhone.</div>""" if from_photos else "")
 
     now = dt.datetime.now().strftime("%-d %b %Y, %H:%M")
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1078,9 +1077,11 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
     import photoscript
     lib = photoscript.PhotosLibrary()
     # one album with each original right next to its smaller copy, for comparing;
-    # and one with just the originals, so they can be deleted with Select All
+    # one with just the originals, so they can be deleted with Select All;
+    # and one with just the smaller copies
     compare_album = lib.album(ALBUM_COMPARE) or lib.create_album(ALBUM_COMPARE)
     old_album = lib.album(ALBUM_ORIGINALS) or lib.create_album(ALBUM_ORIGINALS)
+    new_album = lib.album(ALBUM_COMPRESSED) or lib.create_album(ALBUM_COMPRESSED)
     album_cache: dict[str, object] = {}
     count = 0
     for n, (i, path) in enumerate(done, 1):
@@ -1094,6 +1095,7 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
             compare_album.add([original])     # added as a pair, so they sit together
             compare_album.add([new])
             old_album.add([original])
+            new_album.add([new])
             if v.favorite:
                 new.favorite = True
             m = v.meta
@@ -1133,9 +1135,6 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
 # ---------------------------------------------------------------- albums
 def make_albums(videos: list[Video], groups: list[Group]) -> bool:
     import photoscript
-    delete = [videos[i].id for g in groups for i, (a, _) in g.action.items() if a == "delete"]
-    review = [videos[i].id for g in groups for i, (a, _) in g.action.items() if a == "review"]
-    big = [videos[i].id for i in sorted(range(len(videos)), key=lambda i: -videos[i].size)[:BIGGEST_COUNT]]
     # every video in the "Duplicates and trimmed copies" section, set by set,
     # in the same order as the report (Keep first, then Delete, then Review)
     dupes = []
@@ -1144,14 +1143,10 @@ def make_albums(videos: list[Video], groups: list[Group]) -> bool:
                                     key=lambda m: (g.action[m][0] != "delete", -videos[m].size))
         dupes.extend(videos[m].id for m in order)
     lib = photoscript.PhotosLibrary()
-    for name, ids in ((ALBUM_DUPES, dupes), (ALBUM_DELETE, delete),
-                      (ALBUM_REVIEW, review), (ALBUM_BIG, big)):
-        if not ids:
-            continue
-        album = lib.album(name) or lib.create_album(name)
-        for k in range(0, len(ids), 50):
-            album.add([photoscript.Photo(u) for u in ids[k:k + 50]])
-        print(f"  Album “{name}”: {len(ids)} videos")
+    album = lib.album(ALBUM_DUPES) or lib.create_album(ALBUM_DUPES)
+    for k in range(0, len(dupes), 50):
+        album.add([photoscript.Photo(u) for u in dupes[k:k + 50]])
+    print(f"  Album “{ALBUM_DUPES}”: {len(dupes)} videos")
     return True
 
 # ---------------------------------------------------------------- main
@@ -1266,7 +1261,8 @@ def main() -> None:
     if use_photos and groups:
         want = args.make_albums
         if want is None:
-            want = ask("Create review albums in Photos so you can check and delete these on your iPhone?", True)
+            want = ask("Create an album in Photos with these duplicate and trimmed videos, "
+                       "so you can check and delete them on your iPhone?", True)
         if want:
             print("Adding albums in Photos (Photos will open; allow "
                   f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
