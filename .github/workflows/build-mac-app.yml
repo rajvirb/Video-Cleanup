@@ -18,7 +18,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Build and check the app
-        run: ./build_app.sh
+        run: |
+          set -o pipefail
+          ./build_app.sh 2>&1 | tee build.log
+      - name: Show why the build failed
+        if: failure()
+        # the end of the build log as an annotation, which shows on the run's summary page
+        run: |
+          msg=$(tail -n 60 build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Build failed::$msg"
       - uses: actions/upload-artifact@v4
         with:
           name: Video Cleanup (Apple Silicon)
