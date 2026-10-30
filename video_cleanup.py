@@ -1104,22 +1104,6 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
 
 
 # ---------------------------------------------------------------- albums
-'''
-def make_albums(videos: list[Video], groups: list[Group]) -> bool:
-    import photoscript
-    delete = [videos[i].id for g in groups for i, (a, _) in g.action.items() if a == "delete"]
-    review = [videos[i].id for g in groups for i, (a, _) in g.action.items() if a == "review"]
-    big = [videos[i].id for i in sorted(range(len(videos)), key=lambda i: -videos[i].size)[:BIGGEST_COUNT]]
-    lib = photoscript.PhotosLibrary()
-    for name, ids in ((ALBUM_DELETE, delete), (ALBUM_REVIEW, review), (ALBUM_BIG, big)):
-        if not ids:
-            continue
-        album = lib.album(name) or lib.create_album(name)
-        for k in range(0, len(ids), 50):
-            album.add([photoscript.Photo(u) for u in ids[k:k + 50]])
-        print(f"  Album “{name}”: {len(ids)} videos")
-    return True
-'''
 def make_albums(videos: list[Video], groups: list[Group]) -> bool:
     import photoscript
     delete = [videos[i].id for g in groups for i, (a, _) in g.action.items() if a == "delete"]
