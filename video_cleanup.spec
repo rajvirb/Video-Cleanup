@@ -1,10 +1,15 @@
 # PyInstaller recipe for "Video Cleanup.app". Build it with ./build_app.sh
+from importlib.util import find_spec
+
 from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], ["video_cleanup"]
 # osxphotos and photoscript load parts of themselves (and their AppleScript
-# files) at run time; imageio_ffmpeg carries the ffmpeg program as a data file
-for pkg in ("osxphotos", "photoscript", "imageio_ffmpeg"):
+# files) at run time; imageio_ffmpeg carries the ffmpeg program as a data file;
+# the rest are osxphotos dependencies that read data files of their own
+for pkg in ("osxphotos", "photoscript", "imageio_ffmpeg", "utitools", "tzdata", "osxmetadata"):
+    if not find_spec(pkg):
+        continue
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
