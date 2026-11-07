@@ -84,6 +84,16 @@ def self_test() -> int:
                         "-pix_fmt", "yuv420p", clip], capture_output=True)
         frames = vc.hash_video_frames(ff, clip, vc.probe_duration(ff, clip)) if os.path.exists(clip) else []
         report(len(frames) >= vc.MIN_INFORMATIVE, f"fingerprint a test video ({len(frames)} frames)")
+    if sys.platform == "darwin":
+        # compile (not run) the Photos import script, which checks it against Photos' dictionary
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                r = subprocess.run(["osacompile", "-o", os.path.join(td, "import.scpt"), "-e",
+                                    vc.IMPORT_SCRIPT], capture_output=True, text=True, timeout=120)
+                report(r.returncode == 0, "Photos import script compiles"
+                       + (f": {r.stderr.strip()}" if r.returncode else ""))
+            except subprocess.TimeoutExpired:
+                report(False, "Photos import script: osacompile timed out", warn_only=True)
     enc = vc.pick_encoder(ff)
     report(bool(enc), f"HEVC encoder for making smaller copies: {enc or 'none found'}", warn_only=True)
     return 1 if failed else 0

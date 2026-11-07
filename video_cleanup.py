@@ -496,6 +496,7 @@ def load_from_folder(folder: str, ff: str) -> list[Video]:
 def download_original(v: Video, tmpdir: str) -> str | None:
     """Ask Photos to export (and so download from iCloud) one original."""
     import photoscript
+    no_photos_restarts()
     try:
         out = photoscript.Photo(v.id).export(tmpdir, original=True, overwrite=True, timeout=600)
         out = [o for o in out if Path(o).suffix.lower() in VIDEO_EXTS] or out
@@ -1175,10 +1176,59 @@ def compress_videos(videos: list[Video], items: list[tuple[int, Plan]], ff: str,
     return done
 
 
+# Photos can take far longer than AppleScript's default 2 minutes to import a big
+# video, so the import gets its own, much longer, time limit.
+IMPORT_SCRIPT = """
+on run argv
+    set theFile to POSIX file (item 1 of argv)
+    with timeout of 3600 seconds
+        tell application "Photos"
+            set theItems to import {theFile} skip check duplicates true
+        end tell
+    end timeout
+    if theItems is missing value then return ""
+    set ids to {}
+    repeat with theItem in theItems
+        set end of ids to (id of theItem)
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return ids as text
+end run
+"""
+
+
+def import_into_photos(path: str) -> list[str]:
+    """Import one file into Photos and return the new item's id(s)."""
+    try:
+        r = subprocess.run(["osascript", "-e", IMPORT_SCRIPT, path],
+                           capture_output=True, text=True, timeout=3700)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Photos took more than an hour to import it") from None
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"osascript failed (code {r.returncode})")
+    return [i for i in r.stdout.strip().splitlines() if i]
+
+
+def no_photos_restarts() -> None:
+    """Stop photoscript quitting Photos and retrying when Photos is slow to answer,
+    which interrupts whatever Photos was in the middle of (an import, a download)."""
+    try:
+        from photoscript.script_loader import configure_run_script
+        configure_run_script(retry_enabled=False)
+    except ImportError:          # older photoscript versions don't retry
+        pass
+
+
+def photos_library():
+    import photoscript
+    no_photos_restarts()
+    return photoscript.PhotosLibrary()
+
+
 def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
     """Import the smaller copies into Photos and give each the original's details."""
     import photoscript
-    lib = photoscript.PhotosLibrary()
+    lib = photos_library()
     # one album with each original right next to its smaller copy, for comparing;
     # one with just the originals, so they can be deleted with Select All;
     # and one with just the smaller copies
@@ -1190,10 +1240,11 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
     for n, (i, path) in enumerate(done, 1):
         v = videos[i]
         try:
-            imported = lib.import_photos([path], skip_duplicate_check=True)
-            if not imported:
+            ids = import_into_photos(path)
+            if not ids:
+                print(f"\n  Couldn't import {Path(path).name}: Photos didn't say it had imported it")
                 continue
-            new = imported[0]
+            new = photoscript.Photo(ids[0])
             original = photoscript.Photo(v.id)
             compare_album.add([original])     # added as a pair, so they sit together
             compare_album.add([new])
@@ -1245,7 +1296,7 @@ def make_albums(videos: list[Video], groups: list[Group]) -> bool:
         order = [g.keeper] + sorted((m for m in g.members if m != g.keeper),
                                     key=lambda m: (g.action[m][0] != "delete", -videos[m].size))
         dupes.extend(videos[m].id for m in order)
-    lib = photoscript.PhotosLibrary()
+    lib = photos_library()
     album = lib.album(ALBUM_DUPES) or lib.create_album(ALBUM_DUPES)
     for k in range(0, len(dupes), 50):
         album.add([photoscript.Photo(u) for u in dupes[k:k + 50]])
