@@ -33,6 +33,8 @@ from pathlib import Path
 APP_NAME = "Video Cleanup"
 REPORT_DIR = Path.home() / "Desktop" / "Video Cleanup Report"
 FDA_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+AUTOMATION_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+BUNDLE_ID = "com.rajvirb.videocleanup"         # as in video_cleanup.spec
 
 
 # ---------------------------------------------------------------- worker
@@ -244,6 +246,8 @@ class App:
                     pass
         elif kind == "full_disk_access":
             self.needs_fda = True
+        elif kind == "automation":
+            self.ask_for_automation()
 
     def finished(self, code: int) -> None:
         self.proc = None
@@ -426,6 +430,27 @@ class App:
         self.root.bell()
         self.root.wait_window(win)
         self.asking = False
+
+    def ask_for_automation(self) -> None:
+        if getattr(sys, "frozen", False):
+            who, reset = APP_NAME, f"tccutil reset AppleEvents {BUNDLE_ID}"
+        else:                                  # run from the code: macOS asks on Terminal's behalf
+            who, reset = "Terminal (or Visual Studio Code)", "tccutil reset AppleEvents com.apple.Terminal"
+        steps = [
+            "macOS isn't letting Video Cleanup control Photos, so it can't make albums, "
+            "download videos from iCloud or import the smaller copies. The scan carries on without them.",
+            "",
+            "1. Click Open Settings.",
+            f"2. Under {who}, turn on Photos.",
+            "3. Run the scan again.",
+            "",
+            f"If {who} isn't in the list, macOS needs to ask again. Open Terminal, run this, "
+            "then run the scan again and click OK when asked:",
+            f"    {reset}",
+        ]
+        if self.ask("Open Automation settings?", ["Not now", "Open Settings"],
+                    "Open Settings", steps) == "Open Settings":
+            subprocess.run(["open", AUTOMATION_SETTINGS])
 
     def ask_for_fda(self) -> None:
         steps = [

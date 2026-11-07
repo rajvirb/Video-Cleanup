@@ -1209,6 +1209,32 @@ def import_into_photos(path: str) -> list[str]:
     return [i for i in r.stdout.strip().splitlines() if i]
 
 
+_photos_allowed: bool | None = None
+
+
+def can_control_photos() -> bool:
+    """Check (once) that macOS lets this script control Photos, which it needs for
+    albums, iCloud downloads and imports. macOS asks the person the first time;
+    if the answer was no, explain how to allow it."""
+    global _photos_allowed
+    if _photos_allowed is None:
+        try:
+            r = subprocess.run(["osascript", "-e", 'tell application "Photos" to get name'],
+                               capture_output=True, text=True, timeout=300)
+            # anything other than "not allowed" (-1743) is left for the real call to report
+            _photos_allowed = not (r.returncode and "-1743" in r.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            _photos_allowed = True
+        if not _photos_allowed:
+            if GUI:
+                gui_send("automation")
+            print("  macOS isn't letting this control Photos, so albums, iCloud downloads and "
+                  "imports are skipped. To allow it: System Settings › Privacy & Security › "
+                  f"Automation › {'Video Cleanup' if GUI else 'Terminal (or the app you ran this from)'}"
+                  " › turn on Photos, then run it again.")
+    return _photos_allowed
+
+
 def no_photos_restarts() -> None:
     """Stop photoscript quitting Photos and retrying when Photos is slow to answer,
     which interrupts whatever Photos was in the middle of (an import, a download)."""
@@ -1403,6 +1429,8 @@ def main() -> None:
         download = ask("Download them temporarily for a full check?", False)
 
 
+    if download and not can_control_photos():
+        download = False
     fingerprint_all(videos, ff, bool(download))
 
     print("Looking for matches…")
@@ -1422,6 +1450,7 @@ def main() -> None:
         if want:
             print("Adding albums in Photos (Photos will open; allow "
                   f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
+        if want and can_control_photos():
             try:
                 albums_made = make_albums(videos, groups)
             except Exception as exc:
@@ -1463,6 +1492,8 @@ def main() -> None:
             print(f"Making {len(items)} smaller copies (the originals aren't touched)…")
             if n_cloud:
                 print(f"  {n_cloud} of them are only in iCloud and will be downloaded one at a time first.")
+            if use_photos:
+                can_control_photos()      # ask for permission now, not after the compressing
             done = compress_videos(videos, items, ff, Path(args.compress_dir).expanduser())
             imported = 0
             if done and use_photos:
@@ -1470,7 +1501,7 @@ def main() -> None:
                 if want is None:
                     want = ask("Import the smaller copies into Photos, with the same dates, places, "
                                "favourites and albums?", True)
-                if want:
+                if want and can_control_photos():
                     try:
                         imported = import_copies(videos, done)
                     except Exception as exc:
