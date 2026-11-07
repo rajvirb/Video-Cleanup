@@ -1,3 +1,12 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "osxphotos>=0.70; sys_platform == 'darwin'",
+#   "numpy>=2.0",
+#   "pillow>=10",
+#   "imageio-ffmpeg>=0.5",
+# ]
+# ///
 """
 Video Cleanup — the Mac app.
 
@@ -6,8 +15,8 @@ The scan runs in a separate process (this same program started with --worker).
 That process sends its questions and progress here as "@@{json}" lines, and
 reads the answers on stdin. Everything else it prints goes into the log.
 
-  python app.py               # open the window
-  python app.py --self-test   # check the bundled packages and ffmpeg work
+  uv run app.py               # open the window, straight from the code
+  uv run app.py --self-test   # check the packages and ffmpeg work
 """
 from __future__ import annotations
 

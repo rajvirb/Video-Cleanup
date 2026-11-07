@@ -30,6 +30,19 @@ uv run video_cleanup.py
 
 Your Terminal app needs Full Disk Access too.
 
+## Testing changes
+
+To try a change without building or downloading the app, run it straight from the code:
+
+```bash
+git fetch && git checkout BRANCH-NAME && git pull
+uv run app.py
+```
+
+This opens the same window as the app. It runs as your Terminal app, so it uses
+Terminal's Full Disk Access and Photos permissions. Go back to the main version with
+`git checkout main && git pull`.
+
 ## Building the app
 
 On a Mac with [uv](https://docs.astral.sh/uv/) installed:
