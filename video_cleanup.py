@@ -53,6 +53,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1047,11 +1048,121 @@ def encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple[
     try:
         ok, why = _encode_hevc(ff, encoder, src, part, plan)
         if ok:
+            move_metadata_to_moov(part)
             os.replace(part, dst)
         return ok, why
     finally:
         if os.path.exists(part):
             os.remove(part)
+
+
+def _boxes(buf, start: int, end: int):
+    """(type, offset, header length, size) of each QuickTime box in buf[start:end]."""
+    i = start
+    while i + 8 <= end:
+        size, typ = struct.unpack_from(">I4s", buf, i)
+        hdr = 8
+        if size == 1:
+            size, hdr = struct.unpack_from(">Q", buf, i + 8)[0], 16
+        elif size == 0:
+            size = end - i
+        if size < hdr or i + size > end:
+            return
+        yield typ, i, hdr, size
+        i += size
+
+
+def _box(typ: bytes, body: bytes) -> bytes:
+    return struct.pack(">I4s", len(body) + 8, typ) + body
+
+
+def move_metadata_to_moov(path: str) -> bool:
+    """ffmpeg copies an iPhone video's metadata (device make and model, lens, software,
+    location, date) but writes it in moov/udta/meta, while Apple's software, Photos
+    included, only reads it from moov/meta, where iPhones put it. Move it there.
+    Returns True if the file was changed."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        length = f.tell()
+        f.seek(0)
+        # find moov (and whether the video data comes after it) from the top-level box headers
+        pos, moov, mdat = 0, None, None
+        while pos + 8 <= length:
+            f.seek(pos)
+            head = f.read(16)
+            size, typ = struct.unpack(">I4s", head[:8])
+            if size == 1:
+                size = struct.unpack(">Q", head[8:16])[0]
+            elif size == 0:
+                size = length - pos
+            if size < 8:
+                return False
+            if typ == b"moov":
+                moov = (pos, size)
+            elif typ == b"mdat" and mdat is None:
+                mdat = pos
+            pos += size
+        if not moov or moov[1] > 200_000_000:
+            return False
+        f.seek(moov[0])
+        old = f.read(moov[1])
+
+    children = list(_boxes(old, 8 if struct.unpack_from(">I", old)[0] != 1 else 16, len(old)))
+    if any(typ == b"meta" for typ, *_ in children):
+        return False                     # already where Apple expects it
+    udta = next(((o, h, n) for typ, o, h, n in children if typ == b"udta"), None)
+    if not udta:
+        return False
+    meta = next(((o, h, n) for typ, o, h, n in _boxes(old, udta[0] + udta[1], udta[0] + udta[2])
+                 if typ == b"meta"), None)
+    if not meta:
+        return False
+    body = old[meta[0] + meta[1]:meta[0] + meta[2]]
+    if body[:4] == b"\0\0\0\0" and body[8:12] == b"hdlr":
+        body = body[4:]                  # ffmpeg's version/flags; Apple's moov/meta has none
+    if body[4:8] != b"hdlr" or b"mdta" not in body[:40]:
+        return False
+
+    new_udta = old[udta[0] + udta[1]:meta[0]] + old[meta[0] + meta[2]:udta[0] + udta[2]]
+    parts = []
+    for typ, o, h, n in children:
+        if typ == b"udta":
+            if new_udta:
+                parts.append(_box(b"udta", new_udta))
+        else:
+            parts.append(old[o:o + n])
+    parts.append(_box(b"meta", body))
+    new = bytearray(_box(b"moov", b"".join(parts)))
+
+    # the sample tables point at the video data by its position in the file, which moves
+    # by the change in moov's size when the data comes after moov
+    delta = len(new) - len(old)
+    if delta and mdat is not None and mdat > moov[0]:
+        def fix(start: int, end: int) -> None:
+            for typ, o, h, n in _boxes(new, start, end):
+                if typ in (b"trak", b"mdia", b"minf", b"stbl"):
+                    fix(o + h, o + n)
+                elif typ in (b"stco", b"co64"):
+                    count = struct.unpack_from(">I", new, o + h + 4)[0]
+                    fmt, width = (">I", 4) if typ == b"stco" else (">Q", 8)
+                    for k in range(count):
+                        at = o + h + 8 + k * width
+                        struct.pack_into(fmt, new, at, struct.unpack_from(fmt, new, at)[0] + delta)
+        fix(8, len(new))
+
+    tmp = path + ".meta"
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            out.write(src.read(moov[0]))
+            out.write(new)
+            src.seek(moov[0] + moov[1])
+            shutil.copyfileobj(src, out, 16 * 1024 * 1024)
+        shutil.copystat(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return True
 
 
 def _encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple[bool, str]:
@@ -1074,6 +1185,8 @@ def _encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple
         pre += ["-hwaccel", "videotoolbox"]
     common = (["-vf", ",".join(vf)] if vf else []) + vcodec + [
         "-tag:v", "hvc1", "-map_metadata", "0",
+        # copied from the original file's header, but meaningless as metadata
+        "-metadata", "major_brand=", "-metadata", "minor_version=", "-metadata", "compatible_brands=",
         "-movflags", "+use_metadata_tags+faststart", "-f", "mov", dst]
     # audio: copy every track; if that fails (e.g. spatial audio), keep just the
     # main track; as a last resort re-encode it as AAC
@@ -1145,6 +1258,7 @@ def compress_videos(videos: list[Video], items: list[tuple[int, Plan]], ff: str,
             dst = out_dir / f"{base} - smaller.mov"
             orig_name = f"{base} - original{Path(v.filename).suffix or '.mov'}"
             if dst.exists() and dst.stat().st_size > 0 and (out_dir / orig_name).exists():
+                move_metadata_to_moov(str(dst))  # copies made before this fix
                 done.append((i, str(dst)))       # made on an earlier run
             else:
                 with tempfile.TemporaryDirectory() as td:

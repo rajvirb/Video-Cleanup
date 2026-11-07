@@ -98,6 +98,32 @@ def self_test() -> int:
                 report(False, "Photos import script: osacompile timed out", warn_only=True)
     enc = vc.pick_encoder(ff)
     report(bool(enc), f"HEVC encoder for making smaller copies: {enc or 'none found'}", warn_only=True)
+    if sys.platform == "darwin" and enc:
+        # a smaller copy should keep the camera details, as Apple's own video framework sees them
+        import AVFoundation
+        import Foundation
+
+        def apple_sees(path: str) -> dict:
+            asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
+                Foundation.NSURL.fileURLWithPath_(path), None)
+            return {str(i.key()): str(i.value())
+                    for i in (asset.metadataForFormat_("com.apple.quicktime.mdta") or [])}
+
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "camera.mov")
+            subprocess.run([ff, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=2",
+                            "-pix_fmt", "yuv420p", "-metadata", "com.apple.quicktime.make=Apple",
+                            "-metadata", "com.apple.quicktime.model=iPhone 15 Pro",
+                            "-movflags", "use_metadata_tags", src], capture_output=True)
+            plan = vc.Plan("same", 360, 1000, 0, "test")
+            fixed, unfixed = os.path.join(td, "fixed.mov"), os.path.join(td, "unfixed.mov")
+            vc.encode_hevc(ff, enc, src, fixed, plan)
+            vc._encode_hevc(ff, enc, src, unfixed, plan)
+            seen = apple_sees(fixed) if os.path.exists(fixed) else {}
+            report(seen.get("com.apple.quicktime.model") == "iPhone 15 Pro",
+                   f"smaller copy keeps camera details for Apple's software: {seen}")
+            before = apple_sees(unfixed) if os.path.exists(unfixed) else {}
+            report(True, f"(for comparison, without moving the metadata Apple sees: {before})")
     return 1 if failed else 0
 
 
