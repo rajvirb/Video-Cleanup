@@ -8,7 +8,8 @@ them and delete them yourself on your Mac or iPhone.
 When it starts, it asks:
 
 1. **Videos or photos?**
-2. **Which folders and albums?** Your whole library, or just the ones you tick.
+2. **Which folders and albums?** Your whole library, just the ones you tick, or (for
+   videos) just your largest videos, as many as you choose.
 3. **How strict?**
    - **Strict:** only copies.
    - **Balanced:** copies plus very similar shots, such as bursts and retakes within
@@ -46,6 +47,12 @@ To skip the questions, give the answers, for example:
 ```bash
 uv run video_cleanup.py --media photos --album "Holidays" --album "Kids" --strictness balanced
 ```
+
+Use `--largest 50` to scan just your 50 biggest videos.
+
+Smaller copies of videos are made in `~/Movies/Video Cleanup/Compressed`. Once Photos has
+imported one into its library, the copy and the original next to it are deleted, because Photos
+keeps its own copy. Copies Photos didn't import are kept. Add `--keep-copies` to keep them all.
 
 Your Terminal app needs Full Disk Access too.
 

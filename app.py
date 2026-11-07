@@ -421,7 +421,7 @@ class App:
             self.context = []
         elif kind == "choose":
             answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)),
-                                 msg.get("noun", "video"))
+                                 msg.get("noun", "video"), bool(msg.get("largest")))
             self.context = []
             if answer == "cancel":
                 self.stopping = True
@@ -612,9 +612,10 @@ class App:
         self.show_modal(win)
         return choice.get()
 
-    def choose(self, question: str, items: list[dict], total: int, noun: str = "video") -> str:
-        """Pick everything, or tick folders and albums. Returns "all", "cancel",
-        or a JSON list of the ticked items' ids."""
+    def choose(self, question: str, items: list[dict], total: int, noun: str = "video",
+               largest: bool = False) -> str:
+        """Pick everything, tick folders and albums, or (with largest) just the N biggest.
+        Returns "all", "cancel", "largest:N", or a JSON list of the ticked items' ids."""
         tk, ttk = self.tk, self.ttk
         answer = ["cancel"]
         win, body = self.dialog(size="540x540")
@@ -623,6 +624,16 @@ class App:
         mode = tk.StringVar(value="all")
         ttk.Radiobutton(body, text=f"Everything in my library ({total:,} {noun}s)", variable=mode,
                         value="all").pack(anchor="w", pady=(12, 4))
+        if largest:
+            how_many = tk.StringVar(value=str(min(50, total) or 50))
+            row = ttk.Frame(body)
+            row.pack(anchor="w", pady=(0, 4))
+            ttk.Radiobutton(row, text="Only my largest", variable=mode, value="largest").pack(side="left")
+            spin = ttk.Spinbox(row, from_=1, to=max(total, 1), width=6, textvariable=how_many,
+                               command=lambda: mode.set("largest"))
+            spin.pack(side="left", padx=(6, 6))
+            spin.bind("<FocusIn>", lambda e: mode.set("largest"))
+            ttk.Label(row, text=f"{noun}s").pack(side="left")
         ttk.Radiobutton(body, text="Only the folders and albums I tick:", variable=mode,
                         value="some").pack(anchor="w")
 
@@ -682,6 +693,12 @@ class App:
         def scan() -> None:
             if mode.get() == "all":
                 answer[0] = "all"
+            elif mode.get() == "largest":
+                n = how_many.get().strip()
+                if not n.isdigit() or int(n) < 1:
+                    note.configure(text=f"Type how many {noun}s to scan, such as 50.")
+                    return
+                answer[0] = f"largest:{int(n)}"
             else:
                 picked = [item.get("id") for item, t in zip(items, ticks) if t.get()]
                 if not picked:
