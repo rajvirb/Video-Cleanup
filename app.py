@@ -104,10 +104,38 @@ def self_test() -> int:
         import Foundation
 
         def apple_sees(path: str) -> dict:
+            """The QuickTime metadata Apple's video framework reads from a file."""
+            import threading
             asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
                 Foundation.NSURL.fileURLWithPath_(path), None)
-            return {str(i.key()): str(i.value())
-                    for i in (asset.metadataForFormat_("com.apple.quicktime.mdta") or [])}
+            got, done = [], threading.Event()
+
+            def loaded(items, error):
+                got.extend(items or [])
+                done.set()
+
+            asset.loadMetadataForFormat_completionHandler_(
+                AVFoundation.AVMetadataFormatQuickTimeMetadata, loaded)
+            done.wait(30)
+            return {str(i.key()): str(i.value()) for i in got}
+
+        def where_metadata_is(path: str) -> list[str]:
+            data = open(path, "rb").read()
+            found = []
+
+            def walk(start: int, end: int, at: str) -> None:
+                for typ, o, h, n in vc._boxes(data, start, end):
+                    name = typ.decode("latin1")
+                    if name == "meta":
+                        found.append(f"{at}/meta")
+                    elif name in ("moov", "udta"):
+                        walk(o + h, o + n, f"{at}/{name}")
+            walk(0, len(data), "")
+            return found
+
+        def ffmpeg_sees(path: str) -> list[str]:
+            r = subprocess.run([ff, "-nostdin", "-hide_banner", "-i", path], capture_output=True, text=True)
+            return [line.strip() for line in r.stderr.splitlines() if "com.apple.quicktime" in line]
 
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, "camera.mov")
@@ -115,15 +143,18 @@ def self_test() -> int:
                             "-pix_fmt", "yuv420p", "-metadata", "com.apple.quicktime.make=Apple",
                             "-metadata", "com.apple.quicktime.model=iPhone 15 Pro",
                             "-movflags", "use_metadata_tags", src], capture_output=True)
+            vc.move_metadata_to_moov(src)        # lay it out like an iPhone video
             plan = vc.Plan("same", 360, 1000, 0, "test")
             fixed, unfixed = os.path.join(td, "fixed.mov"), os.path.join(td, "unfixed.mov")
             vc.encode_hevc(ff, enc, src, fixed, plan)
             vc._encode_hevc(ff, enc, src, unfixed, plan)
+            for name, path in (("source", src), ("fixed copy", fixed), ("unfixed copy", unfixed)):
+                if os.path.exists(path):
+                    report(True, f"({name}: metadata at {where_metadata_is(path)}, ffmpeg sees "
+                                 f"{ffmpeg_sees(path)}, Apple sees {apple_sees(path)})")
             seen = apple_sees(fixed) if os.path.exists(fixed) else {}
             report(seen.get("com.apple.quicktime.model") == "iPhone 15 Pro",
                    f"smaller copy keeps camera details for Apple's software: {seen}")
-            before = apple_sees(unfixed) if os.path.exists(unfixed) else {}
-            report(True, f"(for comparison, without moving the metadata Apple sees: {before})")
     return 1 if failed else 0
 
 
