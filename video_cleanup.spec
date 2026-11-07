@@ -40,6 +40,8 @@ for mod in modules:
     binaries += b
     hiddenimports += h
 
+datas.append(("assets/icon.png", "assets"))     # the window's icon (app.py's asset())
+
 a = Analysis(["app.py"], datas=datas, binaries=binaries, hiddenimports=hiddenimports)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Video Cleanup", console=False)
@@ -47,6 +49,7 @@ coll = COLLECT(exe, a.binaries, a.datas, name="Video Cleanup")
 app = BUNDLE(
     coll,
     name="Video Cleanup.app",
+    icon="assets/icon.icns",                     # drawn by tools/make_icon.py
     bundle_identifier="com.rajvirb.videocleanup",
     info_plist={
         "CFBundleShortVersionString": "1.0.0",
