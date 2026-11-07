@@ -22,6 +22,7 @@ jobs:
           set -o pipefail
           ./build_app.sh 2>&1 | tee build.log
       - name: Show the app's self-test results
+        if: always()
         # as an annotation, which shows on the run's summary page
         run: |
           msg=$(grep -E '^(ok|WARN|FAIL) ' build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
@@ -30,7 +31,8 @@ jobs:
         if: failure()
         # the end of the build log as an annotation, which shows on the run's summary page
         run: |
-          msg=$(tail -n 60 build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          # annotations are cut off after a few KB, so leave out PyInstaller's warnings
+          msg=$(grep -v -E 'WARNING|SyntaxWarning|^  title=|^  \)$' build.log | tail -n 30 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           echo "::error title=Build failed::$msg"
       - uses: actions/upload-artifact@v4
         with:
