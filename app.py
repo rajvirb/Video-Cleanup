@@ -104,57 +104,63 @@ def self_test() -> int:
         import Foundation
 
         def apple_sees(path: str) -> dict:
-            """The QuickTime metadata Apple's video framework reads from a file."""
+            """The QuickTime metadata Apple's video framework reads from a file and its video track."""
             import threading
             asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
                 Foundation.NSURL.fileURLWithPath_(path), None)
-            got, done = [], threading.Event()
+            got = []
 
-            def loaded(items, error):
-                got.extend(items or [])
-                done.set()
+            def load(thing) -> None:
+                done = threading.Event()
 
-            asset.loadMetadataForFormat_completionHandler_(
-                AVFoundation.AVMetadataFormatQuickTimeMetadata, loaded)
-            done.wait(30)
+                def loaded(items, error):
+                    got.extend(items or [])
+                    done.set()
+                thing.loadMetadataForFormat_completionHandler_(
+                    AVFoundation.AVMetadataFormatQuickTimeMetadata, loaded)
+                done.wait(30)
+
+            load(asset)
+            for track in asset.tracksWithMediaType_(AVFoundation.AVMediaTypeVideo) or []:
+                load(track)
             return {str(i.key()): str(i.value()) for i in got}
 
-        def where_metadata_is(path: str) -> list[str]:
-            data = open(path, "rb").read()
-            found = []
-
-            def walk(start: int, end: int, at: str) -> None:
-                for typ, o, h, n in vc._boxes(data, start, end):
-                    name = typ.decode("latin1")
-                    if name == "meta":
-                        found.append(f"{at}/meta")
-                    elif name in ("moov", "udta"):
-                        walk(o + h, o + n, f"{at}/{name}")
-            walk(0, len(data), "")
-            return found
-
-        def ffmpeg_sees(path: str) -> list[str]:
-            r = subprocess.run([ff, "-nostdin", "-hide_banner", "-i", path], capture_output=True, text=True)
-            return [line.strip() for line in r.stderr.splitlines() if "com.apple.quicktime" in line]
+        def add_lens_details(path: str, lens: str) -> None:
+            """Give a test clip's video track lens details, stored the way iPhones store them."""
+            import struct
+            key = b"com.apple.quicktime.camera.lens_model"
+            hdlr = vc._box(b"hdlr", b"\0" * 8 + b"mdta" + b"\0" * 13)
+            keys = vc._box(b"keys", struct.pack(">II", 0, 1) + struct.pack(">I4s", 8 + len(key), b"mdta") + key)
+            value = lens.encode()
+            ilst = vc._box(b"ilst", vc._box(struct.pack(">I", 1),
+                                              vc._box(b"data", struct.pack(">II", 1, 0) + value)))
+            meta = vc._box(b"meta", hdlr + keys + ilst)
+            pos, old, mdat = vc._read_moov(path)
+            children = vc._children(old, (0, 8, len(old)))
+            track = vc._video_track(old, children)
+            parts = [old[o:o + n] if (o, n) != (track[1], track[3]) else
+                     vc._box(b"trak", old[o + h:o + n] + meta) for typ, o, h, n in children]
+            vc._write_moov(path, pos, old, bytearray(vc._box(b"moov", b"".join(parts))), mdat)
 
         with tempfile.TemporaryDirectory() as td:
+            # noisy, high quality, so that compressing it really does make it smaller
             src = os.path.join(td, "camera.mov")
-            subprocess.run([ff, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=2",
-                            "-pix_fmt", "yuv420p", "-metadata", "com.apple.quicktime.make=Apple",
+            subprocess.run([ff, "-nostdin", "-v", "error", "-f", "lavfi",
+                            "-i", "testsrc2=s=1280x720:d=2,noise=alls=40:allf=t",
+                            "-c:v", "mpeg4", "-q:v", "1", "-metadata", "com.apple.quicktime.make=Apple",
                             "-metadata", "com.apple.quicktime.model=iPhone 15 Pro",
                             "-movflags", "use_metadata_tags", src], capture_output=True)
             vc.move_metadata_to_moov(src)        # lay it out like an iPhone video
-            plan = vc.Plan("same", 360, 1000, 0, "test")
-            fixed, unfixed = os.path.join(td, "fixed.mov"), os.path.join(td, "unfixed.mov")
-            vc.encode_hevc(ff, enc, src, fixed, plan)
-            vc._encode_hevc(ff, enc, src, unfixed, plan)
-            for name, path in (("source", src), ("fixed copy", fixed), ("unfixed copy", unfixed)):
-                if os.path.exists(path):
-                    report(True, f"({name}: metadata at {where_metadata_is(path)}, ffmpeg sees "
-                                 f"{ffmpeg_sees(path)}, Apple sees {apple_sees(path)})")
-            seen = apple_sees(fixed) if os.path.exists(fixed) else {}
-            report(seen.get("com.apple.quicktime.model") == "iPhone 15 Pro",
-                   f"smaller copy keeps camera details for Apple's software: {seen}")
+            lens = "iPhone 15 Pro back triple camera 6.765mm f/1.78"
+            add_lens_details(src, lens)
+            report(apple_sees(src).get("com.apple.quicktime.camera.lens_model") == lens,
+                   f"test clip has camera details: {apple_sees(src)}")
+            fixed = os.path.join(td, "fixed.mov")
+            ok, why = vc.encode_hevc(ff, enc, src, fixed, vc.Plan("same", 720, 1500, 0, "test"))
+            seen = apple_sees(fixed) if ok else {}
+            report(ok and seen.get("com.apple.quicktime.model") == "iPhone 15 Pro"
+                   and seen.get("com.apple.quicktime.camera.lens_model") == lens,
+                   f"smaller copy keeps camera and lens details for Apple's software: {seen or why}")
     return 1 if failed else 0
 
 

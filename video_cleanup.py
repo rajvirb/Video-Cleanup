@@ -1049,6 +1049,7 @@ def encode_hevc(ff: str, encoder: str, src: str, dst: str, plan: Plan) -> tuple[
         ok, why = _encode_hevc(ff, encoder, src, part, plan)
         if ok:
             move_metadata_to_moov(part)
+            copy_track_metadata(src, part)
             os.replace(part, dst)
         return ok, why
     finally:
@@ -1076,16 +1077,12 @@ def _box(typ: bytes, body: bytes) -> bytes:
     return struct.pack(">I4s", len(body) + 8, typ) + body
 
 
-def move_metadata_to_moov(path: str) -> bool:
-    """ffmpeg copies an iPhone video's metadata (device make and model, lens, software,
-    location, date) but writes it in moov/udta/meta, while Apple's software, Photos
-    included, only reads it from moov/meta, where iPhones put it. Move it there.
-    Returns True if the file was changed."""
+def _read_moov(path: str) -> tuple[int, bytes, int | None] | None:
+    """(position, bytes) of a QuickTime file's moov box, and the position of the
+    first mdat (the video data), or None if there's no moov."""
     with open(path, "rb") as f:
         f.seek(0, 2)
         length = f.tell()
-        f.seek(0)
-        # find moov (and whether the video data comes after it) from the top-level box headers
         pos, moov, mdat = 0, None, None
         while pos + 8 <= length:
             f.seek(pos)
@@ -1096,25 +1093,83 @@ def move_metadata_to_moov(path: str) -> bool:
             elif size == 0:
                 size = length - pos
             if size < 8:
-                return False
+                return None
             if typ == b"moov":
                 moov = (pos, size)
             elif typ == b"mdat" and mdat is None:
                 mdat = pos
             pos += size
         if not moov or moov[1] > 200_000_000:
-            return False
+            return None
         f.seek(moov[0])
-        old = f.read(moov[1])
+        return moov[0], f.read(moov[1]), mdat
 
-    children = list(_boxes(old, 8 if struct.unpack_from(">I", old)[0] != 1 else 16, len(old)))
+
+def _children(buf, box: tuple[int, int, int]) -> list:
+    o, h, n = box
+    return list(_boxes(buf, o + h, o + n))
+
+
+def _write_moov(path: str, pos: int, old: bytes, new: bytearray, mdat: int | None) -> None:
+    """Replace the moov box at pos. The sample tables point at the video data by its
+    position in the file, which moves by the change in moov's size when the data
+    comes after moov, so those positions are corrected."""
+    delta = len(new) - len(old)
+    if delta and mdat is not None and mdat > pos:
+        def fix(start: int, end: int) -> None:
+            for typ, o, h, n in _boxes(new, start, end):
+                if typ in (b"trak", b"mdia", b"minf", b"stbl"):
+                    fix(o + h, o + n)
+                elif typ in (b"stco", b"co64"):
+                    count = struct.unpack_from(">I", new, o + h + 4)[0]
+                    fmt, width = (">I", 4) if typ == b"stco" else (">Q", 8)
+                    for k in range(count):
+                        at = o + h + 8 + k * width
+                        struct.pack_into(fmt, new, at, struct.unpack_from(fmt, new, at)[0] + delta)
+        fix(8, len(new))
+    tmp = path + ".meta"
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            out.write(src.read(pos))
+            out.write(new)
+            src.seek(pos + len(old))
+            shutil.copyfileobj(src, out, 16 * 1024 * 1024)
+        shutil.copystat(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _video_track(buf, moov_children: list) -> tuple | None:
+    """The first trak box whose handler is 'vide'."""
+    for typ, o, h, n in moov_children:
+        if typ != b"trak":
+            continue
+        for mtyp, mo, mh, mn in _children(buf, (o, h, n)):
+            if mtyp == b"mdia":
+                for htyp, ho, hh, hn in _children(buf, (mo, mh, mn)):
+                    if htyp == b"hdlr" and buf[ho + hh + 8:ho + hh + 12] == b"vide":
+                        return typ, o, h, n
+    return None
+
+
+def move_metadata_to_moov(path: str) -> bool:
+    """ffmpeg copies an iPhone video's metadata (device make and model, software,
+    location, date) but writes it in moov/udta/meta, while Apple's software, Photos
+    included, only reads it from moov/meta, where iPhones put it. Move it there.
+    Returns True if the file was changed."""
+    found = _read_moov(path)
+    if not found:
+        return False
+    pos, old, mdat = found
+    children = _children(old, (0, 8 if struct.unpack_from(">I", old)[0] != 1 else 16, len(old)))
     if any(typ == b"meta" for typ, *_ in children):
         return False                     # already where Apple expects it
     udta = next(((o, h, n) for typ, o, h, n in children if typ == b"udta"), None)
     if not udta:
         return False
-    meta = next(((o, h, n) for typ, o, h, n in _boxes(old, udta[0] + udta[1], udta[0] + udta[2])
-                 if typ == b"meta"), None)
+    meta = next(((o, h, n) for typ, o, h, n in _children(old, udta) if typ == b"meta"), None)
     if not meta:
         return False
     body = old[meta[0] + meta[1]:meta[0] + meta[2]]
@@ -1132,36 +1187,39 @@ def move_metadata_to_moov(path: str) -> bool:
         else:
             parts.append(old[o:o + n])
     parts.append(_box(b"meta", body))
+    _write_moov(path, pos, old, bytearray(_box(b"moov", b"".join(parts))), mdat)
+    return True
+
+
+def copy_track_metadata(src: str, dst: str) -> bool:
+    """iPhones keep the lens details (e.g. "back triple camera 6.765mm f/1.78") and
+    35mm focal length in a metadata box inside the video track, which ffmpeg doesn't
+    copy. Copy that box from the original's video track to the copy's.
+    Returns True if dst was changed."""
+    found_src, found_dst = _read_moov(src), _read_moov(dst)
+    if not found_src or not found_dst:
+        return False
+    s = found_src[1]
+    s_track = _video_track(s, _children(s, (0, 8 if struct.unpack_from(">I", s)[0] != 1 else 16, len(s))))
+    meta = s_track and next((s[o:o + n] for typ, o, h, n in _children(s, s_track[1:]) if typ == b"meta"), None)
+    if not meta:
+        return False
+    pos, old, mdat = found_dst
+    children = _children(old, (0, 8 if struct.unpack_from(">I", old)[0] != 1 else 16, len(old)))
+    d_track = _video_track(old, children)
+    if not d_track:
+        return False
+    parts = []
+    for typ, o, h, n in children:
+        if (o, n) == (d_track[1], d_track[3]):
+            inside = [old[co:co + cn] for ctyp, co, ch, cn in _children(old, (o, h, n)) if ctyp != b"meta"]
+            parts.append(_box(b"trak", b"".join(inside) + meta))
+        else:
+            parts.append(old[o:o + n])
     new = bytearray(_box(b"moov", b"".join(parts)))
-
-    # the sample tables point at the video data by its position in the file, which moves
-    # by the change in moov's size when the data comes after moov
-    delta = len(new) - len(old)
-    if delta and mdat is not None and mdat > moov[0]:
-        def fix(start: int, end: int) -> None:
-            for typ, o, h, n in _boxes(new, start, end):
-                if typ in (b"trak", b"mdia", b"minf", b"stbl"):
-                    fix(o + h, o + n)
-                elif typ in (b"stco", b"co64"):
-                    count = struct.unpack_from(">I", new, o + h + 4)[0]
-                    fmt, width = (">I", 4) if typ == b"stco" else (">Q", 8)
-                    for k in range(count):
-                        at = o + h + 8 + k * width
-                        struct.pack_into(fmt, new, at, struct.unpack_from(fmt, new, at)[0] + delta)
-        fix(8, len(new))
-
-    tmp = path + ".meta"
-    try:
-        with open(path, "rb") as src, open(tmp, "wb") as out:
-            out.write(src.read(moov[0]))
-            out.write(new)
-            src.seek(moov[0] + moov[1])
-            shutil.copyfileobj(src, out, 16 * 1024 * 1024)
-        shutil.copystat(path, tmp)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    if bytes(new) == old:
+        return False
+    _write_moov(dst, pos, old, new, mdat)
     return True
 
 
@@ -1258,7 +1316,9 @@ def compress_videos(videos: list[Video], items: list[tuple[int, Plan]], ff: str,
             dst = out_dir / f"{base} - smaller.mov"
             orig_name = f"{base} - original{Path(v.filename).suffix or '.mov'}"
             if dst.exists() and dst.stat().st_size > 0 and (out_dir / orig_name).exists():
-                move_metadata_to_moov(str(dst))  # copies made before this fix
+                # copies made before the metadata fixes
+                move_metadata_to_moov(str(dst))
+                copy_track_metadata(str(out_dir / orig_name), str(dst))
                 done.append((i, str(dst)))       # made on an earlier run
             else:
                 with tempfile.TemporaryDirectory() as td:
