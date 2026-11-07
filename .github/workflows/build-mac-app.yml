@@ -21,6 +21,11 @@ jobs:
         run: |
           set -o pipefail
           ./build_app.sh 2>&1 | tee build.log
+      - name: Show the app's self-test results
+        # as an annotation, which shows on the run's summary page
+        run: |
+          msg=$(grep -E '^(ok|WARN|FAIL) ' build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::notice title=Self-test::$msg"
       - name: Show why the build failed
         if: failure()
         # the end of the build log as an annotation, which shows on the run's summary page
