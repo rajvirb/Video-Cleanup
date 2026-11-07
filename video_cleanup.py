@@ -1792,12 +1792,13 @@ def make_albums(videos: list[Video], groups: list[Group], name: str = ALBUM_DUPE
 
 # ---------------------------------------------------------------- main
 def ask_choice(question: str, options: tuple[str, ...], default: str,
-               labels: tuple[str, ...] | None = None) -> str:
-    """Ask for one of options. labels are the button names the Mac app shows."""
+               labels: tuple[str, ...] | None = None, details: tuple[str, ...] | None = None) -> str:
+    """Ask for one of options. labels are the names the Mac app shows, and details
+    an optional line describing each, which the app shows under its name."""
     if GUI:
         labels = labels or options
         gui_send("ask", question=question, buttons=list(labels),
-                 default=labels[options.index(default)])
+                 default=labels[options.index(default)], details=list(details or []))
         ans = sys.stdin.readline().strip()
         return options[labels.index(ans)] if ans in labels else default
     if not sys.stdin.isatty():
@@ -1831,7 +1832,9 @@ def ask_media(given: str | None) -> str:
         return given
     ans = ask_choice("What would you like to clean up?" if GUI else
                      "What would you like to clean up? Type v for videos or p for photos",
-                     ("v", "p"), "v", ("Videos", "Photos"))
+                     ("v", "p"), "v", ("Videos", "Photos"),
+                     ("Duplicate, re-saved and trimmed videos, the biggest ones, and ones that could be smaller.",
+                      "Duplicate photos and similar shots such as bursts, the biggest ones, and screenshots."))
     return {"v": "videos", "p": "photos"}[ans]
 
 
@@ -1839,16 +1842,20 @@ def ask_strictness(given: str | None, media: str) -> str:
     if given:
         return given
     if media == "photos":
-        print("\n  Strict: only copies of the same photo (identical files, and re-saved or resized copies).")
-        print("  Balanced: copies, plus near-identical shots taken within 10 minutes (bursts, retakes).")
-        print("  Loose: copies, plus similar-looking shots taken within an hour. More to review.")
+        details = ("Only copies of the same photo: identical files, and re-saved or resized copies.",
+                   "Copies, plus near-identical shots taken within 10 minutes, such as bursts and retakes.",
+                   "Copies, plus similar-looking shots taken within an hour. More to review.")
     else:
-        print("\n  Strict: only copies (identical files, re-saved copies and trimmed clips).")
-        print("  Balanced: copies, plus videos that look very similar.")
-        print("  Loose: copies, plus videos that look alike. More to review.")
+        details = ("Only copies: identical files, re-saved copies and trimmed clips.",
+                   "Copies, plus videos that look very similar.",
+                   "Copies, plus videos that look alike. More to review.")
+    if not GUI:
+        print()
+        for name, line in zip(("Strict", "Balanced", "Loose"), details):
+            print(f"  {name}: {line}")
     ans = ask_choice("How strict should the comparison be?" if GUI else
                      "How strict should the comparison be? Type s, b or l", ("s", "b", "l"), "b",
-                     ("Strict", "Balanced", "Loose"))
+                     ("Strict", "Balanced", "Loose"), details)
     return {"s": "strict", "b": "balanced", "l": "loose"}[ans]
 
 
@@ -1887,6 +1894,9 @@ def clean_up_photos(photos: list[Video], source: str, level: str, args, ff: str,
 
     out_dir = Path(args.out or Path.home() / "Desktop" / "Photo Cleanup Report").expanduser()
     out = write_report(photos, groups, ff, out_dir, source, albums_made, True)
+    if GUI:
+        gui_send("summary", noun="photo", scanned=len(photos), sets=len(groups), delete=n_delete,
+                 review=n_review, saving=human_size(saving), album=PHOTO_ALBUM_DUPES if albums_made else "")
     print(f"\nReport: {out}")
     print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
     if not args.no_open:
@@ -2024,7 +2034,12 @@ def main() -> None:
         if choice is None:
             choice = ask_choice("Make smaller copies?" if GUI else
                                 "Make smaller copies? Type s, h, or n for no", ("s", "h", "n"), "n",
-                                ("Same resolution", "Cap at 1080p", "No thanks"))
+                                ("Same resolution", "Cap at 1080p", "No thanks"),
+                                (f"Saves about {human_size(s_same)}, with no visible difference."
+                                 if same else "Nothing to save at the same resolution.",
+                                 f"Saves about {human_size(s_hd)}. A little less sharp on a big 4K TV."
+                                 if hd else "Nothing to save at 1080p.",
+                                 "Leave the videos as they are. Your originals are never changed either way."))
             choice = {"s": "same", "h": "1080p", "n": "no"}[choice]
         items = same if choice == "same" else hd if choice == "1080p" else []
         if items:
@@ -2055,6 +2070,11 @@ def main() -> None:
     out_dir = Path(args.out or Path.home() / "Desktop" / "Video Cleanup Report").expanduser()
     out = write_report(videos, groups, ff, out_dir, source, albums_made, use_photos,
                        cands, comp_result)
+    if GUI:
+        gui_send("summary", noun="video", scanned=len(videos), sets=len(groups), delete=n_delete,
+                 review=sum(1 for g in groups for a, _ in g.action.values() if a == "review"),
+                 saving=human_size(saving), album=ALBUM_DUPES if albums_made else "",
+                 compressed=comp_result["done"] if comp_result else 0)
     print(f"\nReport: {out}")
     print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
     if not args.no_open:

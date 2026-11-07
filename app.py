@@ -164,6 +164,22 @@ def self_test() -> int:
 
 
 # ---------------------------------------------------------------- window
+def asset(name: str) -> Path:
+    """A file from the assets folder, inside the built app or next to this script."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / "assets" / name
+
+
+def eta(seconds: float) -> str:
+    if seconds < 60:
+        return "less than a minute left"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''} left"
+    hours = seconds / 3600
+    return f"about {hours:.0f} hour{'s' if round(hours) != 1 else ''} left"
+
+
 class App:
     def __init__(self) -> None:
         import tkinter as tk
@@ -171,51 +187,132 @@ class App:
         self.tk, self.ttk = tk, ttk
         self.root = root = tk.Tk()
         root.title(APP_NAME)
-        root.geometry("640x480")
-        root.minsize(520, 380)
-        self.bold = font.nametofont("TkDefaultFont").copy()
-        self.bold.configure(weight="bold")
+        root.geometry("620x520")
+        root.minsize(540, 460)
+        self.mac = root.tk.call("tk", "windowingsystem") == "aqua"
+
+        # ---- look: the Mac's own theme, fonts and colours; a tidy theme elsewhere
+        style = ttk.Style(root)
+        if not self.mac and "clam" in style.theme_names():
+            style.theme_use("clam")
+        base = font.nametofont("TkDefaultFont")
+        size = base.cget("size")
+
+        def sized(points: int, weight: str = "normal") -> font.Font:
+            f = base.copy()
+            f.configure(size=points if size > 0 else -points, weight=weight)
+            return f
+        n = abs(size) or 13
+        self.bold = sized(n, "bold")
+        self.title_font = sized(n + 9, "bold")
+        self.head_font = sized(n + 3, "bold")
+        self.big_font = sized(n + 15, "bold")
+        muted = "systemSecondaryLabelColor" if self.mac else "#6e6e73"
+        style.configure("Muted.TLabel", foreground=muted)
+        style.configure("Title.TLabel", font=self.title_font)
+        style.configure("Head.TLabel", font=self.head_font)
+        style.configure("Bold.TLabel", font=self.bold)
+        style.configure("Big.TLabel", font=self.big_font)
+        style.configure("Step.TLabel", font=self.head_font, foreground="#2f5bea" if not self.mac
+                        else "systemBlueColor")
+        style.configure("Option.TRadiobutton", font=self.bold)
+        self.bg = style.lookup("TFrame", "background") or None
+
+        self.icon = None
+        try:
+            self.icon = tk.PhotoImage(file=str(asset("icon.png")))
+            root.iconphoto(True, self.icon)           # also the Dock icon when run from the code
+        except Exception:
+            pass
 
         self.proc: subprocess.Popen | None = None
         self.events: queue.Queue = queue.Queue()
         self.context: list[str] = []     # recent lines, shown above each question
         self.report: str | None = None
+        self.summary: dict = {}
         self.stopping = False
         self.needs_fda = False
         self.asking = False
+        self.progress_label, self.progress_started = "", 0.0
 
-        frame = ttk.Frame(root, padding=20)
-        frame.pack(fill="both", expand=True)
-        title = self.bold.copy()
-        title.configure(size=20)
-        ttk.Label(frame, text=APP_NAME, font=title).pack(anchor="w")
-        ttk.Label(frame, wraplength=580, justify="left", text=(
-            "Finds duplicate, similar and space-wasting videos or photos in your Photos library "
-            "and makes a report you can open in your browser. It never deletes anything: you "
-            "check its suggestions and delete them yourself in Photos.")).pack(anchor="w", pady=(4, 14))
-        self.status = ttk.Label(frame, wraplength=580, justify="left", font=self.bold,
-                                text="The report will be saved in a folder on your Desktop.")
+        outer = ttk.Frame(root, padding=(26, 22, 26, 20))
+        outer.pack(fill="both", expand=True)
+
+        # ---- header: icon, name, one line about what it does
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        if self.icon:
+            self.small_icon = self.icon.subsample(4)
+            ttk.Label(header, image=self.small_icon).pack(side="left", padx=(0, 14))
+        words = ttk.Frame(header)
+        words.pack(side="left", fill="x", expand=True)
+        ttk.Label(words, text=APP_NAME, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(words, style="Muted.TLabel", wraplength=440, justify="left",
+                  text="Finds duplicate and similar videos and photos in your Photos library. "
+                       "It never deletes anything.").pack(anchor="w", pady=(2, 0))
+        ttk.Separator(outer).pack(fill="x", pady=(18, 18))
+
+        # ---- the middle: one of four panels
+        self.body = ttk.Frame(outer)
+        self.body.pack(fill="both", expand=True)
+        self.panels = {name: ttk.Frame(self.body) for name in ("welcome", "running", "done", "problem")}
+
+        welcome = self.panels["welcome"]
+        ttk.Label(welcome, text="How it works", style="Head.TLabel").pack(anchor="w", pady=(0, 10))
+        for k, line in enumerate((
+                "Choose videos or photos, which albums to look in, and how strict to be.",
+                "It finds copies, similar shots and the things taking the most space. "
+                "A big library can take a while.",
+                "Check what it found in a report and in an album in Photos, then delete what "
+                "you don't need yourself."), 1):
+            row = ttk.Frame(welcome)
+            row.pack(fill="x", pady=5)
+            ttk.Label(row, text=str(k), style="Step.TLabel", width=2).pack(side="left", anchor="n")
+            ttk.Label(row, text=line, wraplength=480, justify="left").pack(side="left", fill="x")
+        ttk.Label(welcome, style="Muted.TLabel", wraplength=520, justify="left",
+                  text="Reports are saved in a folder on your Desktop.").pack(anchor="w", pady=(14, 0))
+
+        running = self.panels["running"]
+        self.status = ttk.Label(running, text="Starting…", style="Head.TLabel", wraplength=540, justify="left")
         self.status.pack(anchor="w")
-        self.bar = ttk.Progressbar(frame, mode="determinate", maximum=1)
-        self.bar.pack(fill="x", pady=(8, 2))
-        self.detail = ttk.Label(frame, text="")
+        self.bar = ttk.Progressbar(running, mode="determinate", maximum=1)
+        self.bar.pack(fill="x", pady=(14, 6))
+        self.detail = ttk.Label(running, text="", style="Muted.TLabel")
         self.detail.pack(anchor="w")
 
-        logbox = ttk.Frame(frame)
-        logbox.pack(fill="both", expand=True, pady=(10, 0))
-        self.log = tk.Text(logbox, height=10, wrap="word", state="disabled",
-                           borderwidth=0, highlightthickness=0, font="TkFixedFont")
-        scroll = ttk.Scrollbar(logbox, command=self.log.yview)
+        done = self.panels["done"]
+        self.done_big = ttk.Label(done, text="", style="Big.TLabel", wraplength=540, justify="left")
+        self.done_big.pack(anchor="w")
+        self.done_line = ttk.Label(done, text="", style="Bold.TLabel", wraplength=540, justify="left")
+        self.done_line.pack(anchor="w", pady=(6, 0))
+        self.done_more = ttk.Label(done, text="", style="Muted.TLabel", wraplength=540, justify="left")
+        self.done_more.pack(anchor="w", pady=(10, 0))
+
+        problem = self.panels["problem"]
+        self.problem_head = ttk.Label(problem, text="", style="Head.TLabel", wraplength=540, justify="left")
+        self.problem_head.pack(anchor="w")
+        self.problem_text = ttk.Label(problem, text="", style="Muted.TLabel", wraplength=540, justify="left")
+        self.problem_text.pack(anchor="w", pady=(8, 0))
+
+        # ---- details: the scan's own words, hidden until asked for
+        self.logbox = ttk.Frame(outer)
+        self.log = tk.Text(self.logbox, height=8, wrap="word", state="disabled", borderwidth=0,
+                           highlightthickness=0, font="TkFixedFont", padx=8, pady=6)
+        scroll = ttk.Scrollbar(self.logbox, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(14, 0))
+        # ---- buttons along the bottom
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x", side="bottom", pady=(16, 0))
+        self.details_btn = ttk.Button(buttons, text="Show details", command=self.toggle_details)
+        self.details_btn.pack(side="left")
         self.start_btn = ttk.Button(buttons, text="Start scan", command=self.start, default="active")
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop)
-        self.report_btn = ttk.Button(buttons, text="Open report", command=self.open_report)
-        self.start_btn.pack(side="right")
+        self.report_btn = ttk.Button(buttons, text="Open report", command=self.open_report, default="active")
+        self.photos_btn = ttk.Button(buttons, text="Open Photos", command=self.open_photos)
+        self.show("welcome", [self.start_btn])
 
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.after(50, self.poll)
@@ -223,18 +320,35 @@ class App:
     def run(self) -> None:
         self.root.mainloop()
 
+    def show(self, panel: str, buttons: list) -> None:
+        """Show one panel, and these buttons (right to left: the first is the main one)."""
+        for p in self.panels.values():
+            p.pack_forget()
+        self.panels[panel].pack(fill="both", expand=True)
+        for b in (self.start_btn, self.stop_btn, self.report_btn, self.photos_btn):
+            b.pack_forget()
+        for k, b in enumerate(buttons):
+            b.pack(side="right", padx=(0, 8) if k else 0)
+
+    def toggle_details(self) -> None:
+        if self.logbox.winfo_ismapped():
+            self.logbox.pack_forget()
+            self.details_btn.configure(text="Show details")
+        else:
+            self.logbox.pack(fill="both", expand=True, pady=(14, 0))   # between the panel and the buttons
+            self.details_btn.configure(text="Hide details")
+
     # ---- running the scan
     def start(self) -> None:
-        self.start_btn.pack_forget()
-        self.report_btn.pack_forget()
         self.stop_btn.configure(text="Stop")
-        self.stop_btn.pack(side="right")
+        self.show("running", [self.stop_btn])
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        self.bar.configure(value=0)
+        self.bar.configure(value=0, maximum=1)
         self.detail.configure(text="")
-        self.context, self.report, self.stopping, self.needs_fda = [], None, False, False
+        self.context, self.report, self.summary = [], None, {}
+        self.stopping, self.needs_fda = False, False
         self.set_status("Starting…")
         env = {**os.environ, "VIDEO_CLEANUP_GUI": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         self.proc = subprocess.Popen(
@@ -279,34 +393,41 @@ class App:
         if not line.startswith(" "):           # top-level lines are the stages
             self.set_status(text)
 
+    def answer(self, text: str) -> None:
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write(text + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                pass
+
     def handle_message(self, msg: dict) -> None:
         kind = msg.get("kind")
         if kind == "progress":
+            import time
             n, i = max(int(msg.get("n", 1)), 1), int(msg.get("i", 0))
+            label = msg.get("label", "")
+            if label != self.progress_label or i <= 1:
+                self.progress_label, self.progress_started = label, time.time()
             self.bar.configure(maximum=n, value=i)
-            self.detail.configure(text=f"{msg.get('label', '')}: {i:,} of {n:,}")
+            text = f"{label} · {i:,} of {n:,}"
+            spent = time.time() - self.progress_started
+            if 0 < i < n and spent > 5:
+                text += " · " + eta(spent * (n - i) / i)
+            self.detail.configure(text=text)
         elif kind == "ask":
-            answer = self.ask(msg.get("question", ""), msg.get("buttons", ["OK"]),
-                              msg.get("default"), self.context)
+            self.answer(self.ask(msg.get("question", ""), msg.get("buttons", ["OK"]), msg.get("default"),
+                                 self.context, msg.get("details") or None))
             self.context = []
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.stdin.write(answer + "\n")
-                    self.proc.stdin.flush()
-                except OSError:
-                    pass
         elif kind == "choose":
             answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)),
                                  msg.get("noun", "video"))
             self.context = []
             if answer == "cancel":
                 self.stopping = True
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.stdin.write(answer + "\n")
-                    self.proc.stdin.flush()
-                except OSError:
-                    pass
+            self.answer(answer)
+        elif kind == "summary":
+            self.summary = msg
         elif kind == "full_disk_access":
             self.needs_fda = True
         elif kind == "automation":
@@ -314,20 +435,55 @@ class App:
 
     def finished(self, code: int) -> None:
         self.proc = None
-        self.stop_btn.pack_forget()
         self.start_btn.configure(text="Scan again")
-        self.start_btn.pack(side="right")
         if self.report:
-            self.report_btn.pack(side="right", padx=(0, 8))
-            self.bar.configure(value=self.bar["maximum"])
-            self.set_status("Done. The report has opened in your browser. Nothing was deleted.")
+            self.show_results()
         elif self.needs_fda:
-            self.set_status("Video Cleanup needs Full Disk Access to read your Photos library.")
+            self.show_problem("Video Cleanup needs Full Disk Access",
+                              "It needs it to read your Photos library. Follow the steps in the window "
+                              "that opened, then quit Video Cleanup and open it again.")
             self.ask_for_fda()
         elif self.stopping:
-            self.set_status("Stopped. Nothing was deleted.")
+            self.show_problem("Stopped", "Nothing was deleted. You can start again at any time.")
         else:
-            self.set_status(f"Something went wrong (code {code}). The details are in the log below.")
+            self.show_problem("Something went wrong",
+                              f"The scan stopped unexpectedly (code {code}). Click Show details to see why.")
+
+    def show_results(self) -> None:
+        s = self.summary
+        noun = s.get("noun", "video")
+        sets, delete, review = s.get("sets", 0), s.get("delete", 0), s.get("review", 0)
+        if not s:
+            self.done_big.configure(text="All done")
+            self.done_line.configure(text="The report has opened in your browser.")
+        elif sets:
+            self.done_big.configure(text=f"{s.get('saving', '0 B')} could be freed" if delete else
+                                    f"{sets:,} set{'s' if sets != 1 else ''} to look at")
+            parts = [f"{sets:,} set{'s' if sets != 1 else ''} of duplicate or similar {noun}s"]
+            if delete:
+                parts.append(f"{delete:,} {'copy' if delete == 1 else 'copies'} to delete")
+            if review:
+                parts.append(f"{review:,} to review")
+            self.done_line.configure(text=" · ".join(parts))
+        else:
+            self.done_big.configure(text=f"No duplicate {noun}s found")
+            self.done_line.configure(text=f"Checked {s.get('scanned', 0):,} {noun}s.")
+        more = ["The report has opened in your browser. Nothing was deleted."]
+        if s.get("compressed"):
+            more.append(f"{s['compressed']:,} smaller copies were made.")
+        if s.get("album"):
+            more.append(f"They're also in the album “{s['album']}” in Photos, "
+                        "where you can check and delete them on your Mac or iPhone.")
+        self.done_more.configure(text=" ".join(more))
+        buttons = [self.report_btn] + ([self.photos_btn] if s.get("album") else []) + [self.start_btn]
+        self.start_btn.configure(default="normal")    # Open report is the main button here
+        self.show("done", buttons)
+
+    def show_problem(self, head: str, text: str) -> None:
+        self.problem_head.configure(text=head)
+        self.problem_text.configure(text=text)
+        self.start_btn.configure(default="active")
+        self.show("problem", [self.start_btn])
 
     def stop(self) -> None:
         if not self.proc:
@@ -361,28 +517,65 @@ class App:
 
     def open_report(self) -> None:
         if self.report:
-            webbrowser.open(Path(self.report).as_uri())
+            webbrowser.open(Path(self.report).resolve().as_uri())
 
-    def ask(self, question: str, buttons: list[str], default: str | None,
-            context: list[str] | None = None) -> str:
-        """A dialog with the recent log lines, a question and a row of buttons, in the
-        order given (callers put the default on the right where that's the Mac way)."""
+    def open_photos(self) -> None:
+        subprocess.run(["open", "-a", "Photos"])
+
+    def scroll_with_wheel(self, win, canvas) -> None:
+        """Scroll a canvas with a mouse wheel or trackpad, whichever events this Tk sends:
+        Tk 8.6 sends trackpad scrolling as <MouseWheel>, Tk 9 as <TouchpadScroll>."""
+        canvas.configure(yscrollincrement=1)      # so a "unit" is one pixel
+
+        def wheel(e):
+            d = e.delta                           # 120 a notch on a mouse; small steps from a Tk 8.6 trackpad
+            canvas.yview_scroll(int(-d * 30 / 120) if abs(d) >= 120 else -d * 10, "units")
+
+        def touchpad(e):
+            dx, dy = (int(v) for v in self.root.tk.splitlist(
+                self.root.tk.call("tk::PreciseScrollDeltas", e.delta)))
+            if dy:
+                canvas.yview_scroll(-dy, "units")
+
+        win.bind("<MouseWheel>", wheel)
+        win.bind("<Button-4>", lambda e: canvas.yview_scroll(-30, "units"))   # X11
+        win.bind("<Button-5>", lambda e: canvas.yview_scroll(30, "units"))
+        try:
+            win.bind("<TouchpadScroll>", touchpad)
+        except self.tk.TclError:                  # Tk 8.6 has no such event
+            pass
+
+    def dialog(self, title: str = APP_NAME, size: str | None = None):
         tk, ttk = self.tk, self.ttk
-        default = default if default in buttons else buttons[-1]
-        answer = [default]
         self.asking = True
         win = tk.Toplevel(self.root)
-        win.title(APP_NAME)
+        win.title(title)
         win.transient(self.root)
-        win.resizable(False, False)
-        body = ttk.Frame(win, padding=20)
+        if size:
+            win.geometry(size)
+        else:
+            win.resizable(False, False)
+        body = ttk.Frame(win, padding=(24, 20, 24, 18))
         body.pack(fill="both", expand=True)
+        return win, body
+
+    def ask(self, question: str, buttons: list[str], default: str | None,
+            context: list[str] | None = None, details: list[str] | None = None) -> str:
+        """A question with a row of buttons, in the order given (callers put the default on
+        the right where that's the Mac way) — or, with a line describing each choice, a
+        list of options to pick from."""
+        if details and len(details) == len(buttons):
+            return self.ask_options(question, buttons, default, details)
+        ttk = self.ttk
+        default = default if default in buttons else buttons[-1]
+        answer = [default]
+        win, body = self.dialog()
+        ttk.Label(body, text=question, style="Head.TLabel", wraplength=480, justify="left").pack(anchor="w")
         if context:
-            ttk.Label(body, text="\n".join(context), wraplength=480,
-                      justify="left").pack(anchor="w", pady=(0, 12))
-        ttk.Label(body, text=question, wraplength=480, justify="left", font=self.bold).pack(anchor="w")
+            ttk.Label(body, text="\n".join(context), style="Muted.TLabel", wraplength=480,
+                      justify="left").pack(anchor="w", pady=(10, 0))
         row = ttk.Frame(body)
-        row.pack(fill="x", pady=(18, 0))
+        row.pack(fill="x", pady=(20, 0))
 
         def choose(b: str) -> None:
             answer[0] = b
@@ -397,30 +590,48 @@ class App:
         self.show_modal(win)
         return answer[0]
 
+    def ask_options(self, question: str, options: list[str], default: str | None, details: list[str]) -> str:
+        tk, ttk = self.tk, self.ttk
+        choice = tk.StringVar(value=default if default in options else options[0])
+        win, body = self.dialog()
+        ttk.Label(body, text=question, style="Head.TLabel", wraplength=460, justify="left").pack(anchor="w")
+        for option, line in zip(options, details):
+            row = ttk.Frame(body)
+            row.pack(fill="x", pady=(14, 0))
+            ttk.Radiobutton(row, text=option, value=option, variable=choice,
+                            style="Option.TRadiobutton").pack(anchor="w")
+            text = ttk.Label(row, text=line, style="Muted.TLabel", wraplength=430, justify="left")
+            text.pack(anchor="w", padx=(26, 0))
+            text.bind("<Button-1>", lambda e, o=option: choice.set(o))
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(22, 0))
+        ttk.Button(row, text="Continue", command=win.destroy, default="active").pack(side="right")
+        win.bind("<Return>", lambda e: win.destroy())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        self.show_modal(win)
+        return choice.get()
+
     def choose(self, question: str, items: list[dict], total: int, noun: str = "video") -> str:
         """Pick everything, or tick folders and albums. Returns "all", "cancel",
         or a JSON list of the ticked items' ids."""
         tk, ttk = self.tk, self.ttk
         answer = ["cancel"]
-        self.asking = True
-        win = tk.Toplevel(self.root)
-        win.title(APP_NAME)
-        win.transient(self.root)
-        win.geometry("520x480")
-        win.minsize(420, 320)
-        body = ttk.Frame(win, padding=20)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text=question, font=self.bold).pack(anchor="w")
+        win, body = self.dialog(size="540x540")
+        win.minsize(440, 380)
+        ttk.Label(body, text=question, style="Head.TLabel").pack(anchor="w")
         mode = tk.StringVar(value="all")
         ttk.Radiobutton(body, text=f"Everything in my library ({total:,} {noun}s)", variable=mode,
-                        value="all").pack(anchor="w", pady=(10, 2))
+                        value="all").pack(anchor="w", pady=(12, 4))
         ttk.Radiobutton(body, text="Only the folders and albums I tick:", variable=mode,
                         value="some").pack(anchor="w")
 
         # a scrollable list of tick boxes, indented to show what's inside each folder
-        box = ttk.Frame(body)
-        box.pack(fill="both", expand=True, pady=(6, 0))
+        box = ttk.Frame(body, padding=(0, 8, 0, 0))
+        box.pack(fill="both", expand=True)
         canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0)
+        if self.bg:
+            canvas.configure(background=self.bg)
         scroll = ttk.Scrollbar(box, command=canvas.yview)
         canvas.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -428,8 +639,7 @@ class App:
         inner = ttk.Frame(canvas)
         canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta if abs(e.delta) < 20
-                                                               else -e.delta // 120, "units"))
+        self.scroll_with_wheel(win, canvas)
 
         ticks = [tk.BooleanVar(value=False) for _ in items]
 
@@ -451,11 +661,22 @@ class App:
             count = int(item.get("count", 0))
             text = f"{item.get('label', '')}  ({count:,} {noun}{'' if count == 1 else 's'})"
             row = ttk.Frame(inner)
-            row.pack(anchor="w", padx=(20 * int(item.get("depth", 0)), 0), pady=1)
+            row.pack(anchor="w", padx=(22 * int(item.get("depth", 0)), 0), pady=2)
             ttk.Checkbutton(row, variable=ticks[k], command=lambda k=k: toggled(k)).pack(side="left")
-            ttk.Label(row, text=text, font=self.bold if item.get("folder") else None).pack(side="left")
+            label = ttk.Label(row, text=text, style="Bold.TLabel" if item.get("folder") else "TLabel")
+            label.pack(side="left")
 
-        note = ttk.Label(body, text="")
+            def click(e, k=k) -> None:        # clicking the name ticks it too
+                ticks[k].set(not ticks[k].get())
+                toggled(k)
+            label.bind("<Button-1>", click)
+
+        def tick_all(value: bool) -> None:
+            mode.set("some" if value else mode.get())
+            for t in ticks:
+                t.set(value)
+
+        note = ttk.Label(body, text="", style="Muted.TLabel")
         note.pack(anchor="w", pady=(6, 0))
 
         def scan() -> None:
@@ -475,6 +696,8 @@ class App:
 
         row = ttk.Frame(body)
         row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Select all", command=lambda: tick_all(True)).pack(side="left")
+        ttk.Button(row, text="Clear", command=lambda: tick_all(False)).pack(side="left", padx=(8, 0))
         ttk.Button(row, text="Scan", command=scan, default="active").pack(side="right", padx=(8, 0))
         ttk.Button(row, text="Cancel", command=cancel).pack(side="right")
         win.bind("<Return>", lambda e: scan())
