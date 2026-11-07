@@ -32,7 +32,8 @@ between), plus your biggest photos and screenshots.
 Usage
   uv run video_cleanup.py                 # scan your Photos library
   uv run video_cleanup.py --folder DIR    # scan a folder of video files instead
-  options: --media videos|photos, --strictness strict|balanced|loose,
+  options: --media videos|photos, --strictness strict|balanced|loose, --largest N,
+           --compress no|same|1080p, --import / --no-import, --keep-copies,
            --download-missing / --no-download, --make-albums / --no-albums,
            --out DIR, --library PATH, --album NAME
 """
@@ -155,6 +156,10 @@ def human_size(n: float) -> str:
             return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
         n /= 1000
     return f"{n:.1f} TB"
+
+
+def copies(n: int) -> str:
+    return f"{n} smaller {'copy' if n == 1 else 'copies'}"
 
 
 def plural(n: int, word: str) -> str:
@@ -365,8 +370,9 @@ def parse_numbers(text: str, n: int) -> list[int] | None:
 
 
 def choose_albums(items: list[dict], total: int, names: list[str] | None,
-                  noun: str = "video") -> list[dict] | None:
-    """Ask which folders and albums to scan. Returns the chosen ones, or None for everything."""
+                  noun: str = "video") -> list[dict] | int | None:
+    """Ask which folders and albums to scan. Returns the chosen ones, None for everything,
+    or (for videos) a number N for just the N largest."""
     if names:
         wanted = {n.casefold() for n in names}
         chosen = [i for i in items if i["title"].casefold() in wanted]
@@ -377,12 +383,14 @@ def choose_albums(items: list[dict], total: int, names: list[str] | None,
         return chosen
     question = "What would you like to scan?"
     if GUI:
-        gui_send("choose", question=question, total=total, noun=noun,
+        gui_send("choose", question=question, total=total, noun=noun, largest=noun == "video",
                  items=[{"id": i["id"], "label": i["title"], "folder": i["folder"],
                          "depth": i["depth"], "count": len(i["uuids"])} for i in items])
         ans = sys.stdin.readline().strip()
         if ans == "cancel":
             sys.exit("Cancelled. Nothing was scanned.")
+        if ans.startswith("largest:") and ans[8:].isdigit() and int(ans[8:]) > 0:
+            return int(ans[8:])
         try:
             ids = set(json.loads(ans))
         except (ValueError, TypeError):
@@ -395,15 +403,21 @@ def choose_albums(items: list[dict], total: int, names: list[str] | None,
     for n, i in enumerate(items, 1):
         kind = "folder, " if i["folder"] else ""
         print(f"  {n:>{width}}. {'   ' * i['depth']}{i['title']} ({kind}{plural(len(i['uuids']), noun)})")
+    largest = f", type 'largest 50' for your 50 biggest {noun}s," if noun == "video" else ""
     while True:
         try:
-            ans = input("Type the numbers to scan, separated by commas (e.g. 1, 4-6), "
+            ans = input(f"Type the numbers to scan, separated by commas (e.g. 1, 4-6){largest} "
                         "or press Enter to scan everything: ")
         except EOFError:
             return None
+        words = ans.lower().split()
+        if noun == "video" and len(words) == 2 and words[0] == "largest" and words[1].isdigit() \
+                and int(words[1]) > 0:
+            return int(words[1])
         picked = parse_numbers(ans, len(items))
         if picked is None:
-            print(f"  Please type numbers from 1 to {len(items)}.")
+            print(f"  Please type numbers from 1 to {len(items)}"
+                  + (", or 'largest' and a number." if noun == "video" else "."))
         elif not picked:
             return None
         else:
@@ -421,12 +435,17 @@ def photo_meta(p) -> dict:
     }
 
 
+LIBRARY_PATH: str | None = None     # the .photoslibrary being scanned, once it's open
+
+
 def load_from_photos(library: str | None, albums: list[str] | None = None,
-                     media: str = "videos") -> tuple[list[Video], str]:
+                     media: str = "videos", largest: int | None = None) -> tuple[list[Video], str]:
     """The videos (or photos) to scan, and a description of where they came from for the report."""
     import osxphotos
     print("Reading your Photos library (read-only)…")
     db = osxphotos.PhotosDB(dbfile=library) if library else osxphotos.PhotosDB()
+    global LIBRARY_PATH
+    LIBRARY_PATH = getattr(db, "library_path", None) or library
     candidates = []
     noun = "photo" if media == "photos" else "video"
     for p in db.photos(images=media == "photos", movies=media != "photos"):
@@ -443,8 +462,15 @@ def load_from_photos(library: str | None, albums: list[str] | None = None,
 
     source = "Photos library"
     items = photos_choices(db, {p.uuid for p in candidates})
-    chosen = choose_albums(items, len(candidates), albums, noun) if items else None
-    if chosen:
+    chosen = largest or (choose_albums(items, len(candidates), albums, noun) if items else None)
+    if isinstance(chosen, int):
+        def size(p) -> int:
+            return int(getattr(p, "original_filesize", 0) or 0)
+        candidates = sorted(candidates, key=size, reverse=True)[:chosen]
+        source = f"Photos: your {plural(len(candidates), 'largest ' + noun)}"
+        print(f"Scanning your {plural(len(candidates), 'largest ' + noun)} "
+              f"({human_size(sum(size(p) for p in candidates))}).")
+    elif chosen:
         keep = set().union(*(i["uuids"] for i in chosen))
         candidates = [p for p in candidates if p.uuid in keep]
         titles = [i["title"] for i in chosen]
@@ -1070,7 +1096,7 @@ def write_photo_report(photos: list[Video], groups: list[Group], ff: str, out_di
 <p class="sub">{e(source_label)} · scanned {now} · nothing has been deleted</p>
 <div class="stats">
   <div class="stat"><div class="n">{len(photos):,}</div><div class="l">photos · {human_size(total)}</div></div>
-  <div class="stat hi"><div class="n">{human_size(saving)}</div><div class="l">could be freed by {plural(n_delete, "copy").replace("copys", "copies")}</div></div>
+  <div class="stat hi"><div class="n">{human_size(saving)}</div><div class="l">could be freed by {n_delete} {"copy" if n_delete == 1 else "copies"}</div></div>
   <div class="stat"><div class="n">{n_review}</div><div class="l">similar shots to check</div></div>
   <div class="stat"><div class="n">{human_size(shots_size)}</div><div class="l">in {plural(len(shots), "screenshot")}</div></div>
 </div>
@@ -1158,9 +1184,13 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
         comp_cards.append(card(v, thumbs.get(i), "", " · ".join(lines)))
     if comp_result:
         cr = comp_result
+        where = (f"""The files used for importing were deleted from <i>{html.escape(cr['dir'])}</i>
+          once Photos had its own copies.""" if cr.get("removed") and not cr.get("kept") else
+                 f"""{copies(cr.get('kept', cr['done']))} {'is' if cr.get('kept', cr['done']) == 1 else 'are'}
+          in <i>{html.escape(cr['dir'])}</i>, each next to a copy of its original, named “… - smaller” and
+          “… - original”, so you can compare them.""")
         comp_status = (f"""<div class="callout"><b>{cr['done']} smaller copies made</b>, saving
-          {human_size(cr['saved'])}. Each one is next to a copy of its original in
-          <i>{html.escape(cr['dir'])}</i>, named “… - smaller” and “… - original”, so you can compare them.""" +
+          {human_size(cr['saved'])}. {where}""" +
           (f""" {cr['imported']} were imported into Photos with their dates, places, favourites and albums.
           The album <i>{html.escape(ALBUM_COMPARE)}</i> has each original right next to its smaller copy,
           so you can compare them, and <i>{html.escape(ALBUM_COMPRESSED)}</i> has just the smaller copies.
@@ -1712,8 +1742,42 @@ def photos_library():
     return photoscript.PhotosLibrary()
 
 
-def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
-    """Import the smaller copies into Photos and give each the original's details."""
+def remove_imported_copies(imported: list[tuple[int, str, str]], out_dir: Path) -> int:
+    """Photos keeps its own copy of whatever it imports, so once a smaller copy is in the
+    library, the file it came from (and the original's copy next to it) is no longer
+    needed. Only delete them when Photos really holds its own copy: its library's
+    originals folder has a file of the same size under the new item's id. If Photos is
+    set not to copy imported items, it uses our file where it is, so it's kept.
+    Returns how many files were deleted."""
+    import glob
+    originals = Path(LIBRARY_PATH or "") / "originals"
+    removed = 0
+    for i, path, new_id in imported:
+        uuid = new_id.split("/")[0]
+        mine = Path(path)
+        if not (uuid and mine.exists() and originals.is_dir()):
+            continue
+        theirs = [f for f in originals.glob(f"{uuid[0]}/{uuid}.*") if f.is_file()]
+        if not any(f.stat().st_size == mine.stat().st_size for f in theirs):
+            continue
+        base = mine.name[:-len(" - smaller.mov")] if mine.name.endswith(" - smaller.mov") else None
+        others = list(out_dir.glob(glob.escape(base) + " - original.*")) if base else []
+        for f in [mine] + others:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    try:
+        out_dir.rmdir()          # only if nothing else is left in it
+    except OSError:
+        pass
+    return removed
+
+
+def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> list[tuple[int, str, str]]:
+    """Import the smaller copies into Photos and give each the original's details.
+    Returns (video, file, new Photos id) for each one imported."""
     import photoscript
     lib = photos_library()
     # one album with each original right next to its smaller copy, for comparing;
@@ -1723,7 +1787,7 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
     old_album = lib.album(ALBUM_ORIGINALS) or lib.create_album(ALBUM_ORIGINALS)
     new_album = lib.album(ALBUM_COMPRESSED) or lib.create_album(ALBUM_COMPRESSED)
     album_cache: dict[str, object] = {}
-    count = 0
+    imported = []
     for n, (i, path) in enumerate(done, 1):
         v = videos[i]
         try:
@@ -1766,11 +1830,11 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
                     album_cache[name] = lib.album(name)
                 if album_cache[name]:
                     album_cache[name].add([new])
-            count += 1
+            imported.append((i, path, ids[0]))
         except Exception as exc:
             print(f"\n  Couldn't import {Path(path).name}: {exc}")
         progress("Importing", n, len(done))
-    return count
+    return imported
 
 
 # ---------------------------------------------------------------- albums
@@ -1929,6 +1993,10 @@ def main() -> None:
                     help="import the smaller copies into Photos")
     im.add_argument("--no-import", dest="do_import", action="store_false")
     ap.add_argument("--compress-dir", default=str(COMPRESS_DIR))
+    ap.add_argument("--keep-copies", action="store_true",
+                    help="keep the smaller copies in --compress-dir even once they're in Photos")
+    ap.add_argument("--largest", type=int, metavar="N",
+                    help="only scan your N largest videos (without it you're asked what to scan)")
     ap.add_argument("--no-open", action="store_true", help="don't open the report when done")
     args = ap.parse_args()
 
@@ -1942,7 +2010,8 @@ def main() -> None:
     noun = "photo" if media == "photos" else "video"
     if use_photos:
         try:
-            videos, source = load_from_photos(args.library, args.album, media)
+            videos, source = load_from_photos(args.library, args.album, media,
+                                              args.largest if media == "videos" else None)
         except Exception as exc:
             msg = str(exc)
             print(f"\nCouldn't read the Photos library: {msg}")
@@ -2049,8 +2118,10 @@ def main() -> None:
                 print(f"  {n_cloud} of them are only in iCloud and will be downloaded one at a time first.")
             if use_photos:
                 can_control_photos()      # ask for permission now, not after the compressing
-            done = compress_videos(videos, items, ff, Path(args.compress_dir).expanduser())
-            imported = 0
+            out_dir = Path(args.compress_dir).expanduser()
+            done = compress_videos(videos, items, ff, out_dir)
+            saved = sum(videos[i].size - os.path.getsize(d) for i, d in done)
+            imported, removed = [], 0
             if done and use_photos:
                 want = args.do_import
                 if want is None:
@@ -2061,10 +2132,19 @@ def main() -> None:
                         imported = import_copies(videos, done)
                     except Exception as exc:
                         print(f"  Couldn't import into Photos: {exc}")
+                if imported and not args.keep_copies:
+                    removed = remove_imported_copies(imported, out_dir)
+                    if removed:
+                        print(f"  Deleted {plural(removed, 'temporary file')} from {out_dir}, "
+                              "now that Photos has its own copies.")
+                    kept = sum(1 for _, d in done if os.path.exists(d))
+                    if kept:
+                        print(f"  Kept {copies(kept)} in {out_dir}: Photos didn't import them, "
+                              "or uses the files where they are.")
             comp_result = {
-                "mode": choice, "done": len(done), "imported": imported,
-                "saved": sum(videos[i].size - os.path.getsize(d) for i, d in done),
-                "dir": str(Path(args.compress_dir).expanduser()),
+                "mode": choice, "done": len(done), "imported": len(imported), "removed": removed,
+                "kept": sum(1 for _, d in done if os.path.exists(d)),
+                "saved": saved, "dir": str(out_dir),
             }
 
     out_dir = Path(args.out or Path.home() / "Desktop" / "Video Cleanup Report").expanduser()
