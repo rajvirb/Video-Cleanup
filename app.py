@@ -31,7 +31,6 @@ import webbrowser
 from pathlib import Path
 
 APP_NAME = "Video Cleanup"
-REPORT_DIR = Path.home() / "Desktop" / "Video Cleanup Report"
 FDA_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 AUTOMATION_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
 BUNDLE_ID = "com.rajvirb.videocleanup"         # as in video_cleanup.spec
@@ -191,11 +190,11 @@ class App:
         title.configure(size=20)
         ttk.Label(frame, text=APP_NAME, font=title).pack(anchor="w")
         ttk.Label(frame, wraplength=580, justify="left", text=(
-            "Finds duplicate, trimmed and space-wasting videos in your Photos library and "
-            "makes a report you can open in your browser. It never deletes anything: you "
-            "check its suggestions and delete videos yourself in Photos.")).pack(anchor="w", pady=(4, 14))
+            "Finds duplicate, similar and space-wasting videos or photos in your Photos library "
+            "and makes a report you can open in your browser. It never deletes anything: you "
+            "check its suggestions and delete them yourself in Photos.")).pack(anchor="w", pady=(4, 14))
         self.status = ttk.Label(frame, wraplength=580, justify="left", font=self.bold,
-                                text=f"The report will be saved on your Desktop, in “{REPORT_DIR.name}”.")
+                                text="The report will be saved in a folder on your Desktop.")
         self.status.pack(anchor="w")
         self.bar = ttk.Progressbar(frame, mode="determinate", maximum=1)
         self.bar.pack(fill="x", pady=(8, 2))
@@ -297,7 +296,8 @@ class App:
                 except OSError:
                     pass
         elif kind == "choose":
-            answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)))
+            answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)),
+                                 msg.get("noun", "video"))
             self.context = []
             if answer == "cancel":
                 self.stopping = True
@@ -343,7 +343,7 @@ class App:
 
     def quit(self) -> None:
         if self.proc and self.proc.poll() is None:
-            if self.ask("A scan is still running. Stop it and quit?", ["Keep scanning", "Quit"],
+            if self.ask("A scan is still running. Stop it and quit?", ["Quit", "Keep scanning"],
                         "Keep scanning") != "Quit":
                 return
             self.proc.kill()
@@ -365,8 +365,8 @@ class App:
 
     def ask(self, question: str, buttons: list[str], default: str | None,
             context: list[str] | None = None) -> str:
-        """A dialog with the recent log lines, a question and a row of buttons.
-        The default button sits on the right, as on other Mac dialogs."""
+        """A dialog with the recent log lines, a question and a row of buttons, in the
+        order given (callers put the default on the right where that's the Mac way)."""
         tk, ttk = self.tk, self.ttk
         default = default if default in buttons else buttons[-1]
         answer = [default]
@@ -388,7 +388,7 @@ class App:
             answer[0] = b
             win.destroy()
 
-        for b in [default] + [b for b in reversed(buttons) if b != default]:
+        for b in reversed(buttons):           # in the order given, left to right
             ttk.Button(row, text=b, command=lambda b=b: choose(b),
                        default="active" if b == default else "normal").pack(side="right", padx=(8, 0))
         win.bind("<Return>", lambda e: choose(default))
@@ -397,7 +397,7 @@ class App:
         self.show_modal(win)
         return answer[0]
 
-    def choose(self, question: str, items: list[dict], total: int) -> str:
+    def choose(self, question: str, items: list[dict], total: int, noun: str = "video") -> str:
         """Pick everything, or tick folders and albums. Returns "all", "cancel",
         or a JSON list of the ticked items' ids."""
         tk, ttk = self.tk, self.ttk
@@ -412,7 +412,7 @@ class App:
         body.pack(fill="both", expand=True)
         ttk.Label(body, text=question, font=self.bold).pack(anchor="w")
         mode = tk.StringVar(value="all")
-        ttk.Radiobutton(body, text=f"Everything in my library ({total:,} videos)", variable=mode,
+        ttk.Radiobutton(body, text=f"Everything in my library ({total:,} {noun}s)", variable=mode,
                         value="all").pack(anchor="w", pady=(10, 2))
         ttk.Radiobutton(body, text="Only the folders and albums I tick:", variable=mode,
                         value="some").pack(anchor="w")
@@ -449,7 +449,7 @@ class App:
 
         for k, item in enumerate(items):
             count = int(item.get("count", 0))
-            text = f"{item.get('label', '')}  ({count:,} video{'' if count == 1 else 's'})"
+            text = f"{item.get('label', '')}  ({count:,} {noun}{'' if count == 1 else 's'})"
             row = ttk.Frame(inner)
             row.pack(anchor="w", padx=(20 * int(item.get("depth", 0)), 0), pady=1)
             ttk.Checkbutton(row, variable=ticks[k], command=lambda k=k: toggled(k)).pack(side="left")

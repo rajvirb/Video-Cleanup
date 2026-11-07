@@ -1,9 +1,22 @@
 # Video Cleanup
 
-Finds duplicate, trimmed and space-wasting videos in your Apple Photos library and
-makes a report you can open in your browser. It never deletes anything: it can put
-its suggestions into albums in Photos, so you can check them and delete them yourself
-on your Mac or iPhone.
+Finds duplicate, trimmed and space-wasting videos, or duplicate and similar photos, in
+your Apple Photos library and makes a report you can open in your browser. It never
+deletes anything: it can put its suggestions into albums in Photos, so you can check
+them and delete them yourself on your Mac or iPhone.
+
+When it starts, it asks:
+
+1. **Videos or photos?**
+2. **Which folders and albums?** Your whole library, or just the ones you tick.
+3. **How strict?**
+   - **Strict:** only copies.
+   - **Balanced:** copies plus very similar shots, such as bursts and retakes within
+     10 minutes.
+   - **Loose:** copies plus look-alikes taken within an hour.
+
+A photo is only marked **Delete** when it's clearly a copy: the identical file, or the
+same picture taken at the same moment. Similar shots are only ever marked **Review**.
 
 ## Using the app
 
@@ -28,8 +41,11 @@ The app is built for Apple Silicon Macs (M1 and later).
 uv run video_cleanup.py
 ```
 
-It first asks whether to scan your whole library or just some of your folders and
-albums. To skip the question, name them: `uv run video_cleanup.py --album "Holidays" --album "Kids"`.
+To skip the questions, give the answers, for example:
+
+```bash
+uv run video_cleanup.py --media photos --album "Holidays" --album "Kids" --strictness balanced
+```
 
 Your Terminal app needs Full Disk Access too.
 

@@ -9,7 +9,7 @@
 # ///
 
 """
-Video Cleanup — find duplicate and space-wasting videos in your Photos library.
+Video Cleanup — find duplicate and space-wasting videos (or photos) in your Photos library.
 
 It only READS your library. It never deletes anything. It writes an HTML report
 and, if you agree, adds the duplicates it finds to an album in Photos so you can
@@ -25,10 +25,15 @@ What it finds
     makes the smaller copies and imports them into Photos with the same date,
     place, favourite status and albums (your originals are never changed)
 
+For photos it finds identical copies, re-saved or resized copies (same picture,
+same moment), and similar shots such as bursts and retakes (for you to choose
+between), plus your biggest photos and screenshots.
+
 Usage
   uv run video_cleanup.py                 # scan your Photos library
   uv run video_cleanup.py --folder DIR    # scan a folder of video files instead
-  options: --download-missing / --no-download, --make-albums / --no-albums,
+  options: --media videos|photos, --strictness strict|balanced|loose,
+           --download-missing / --no-download, --make-albums / --no-albums,
            --out DIR, --library PATH, --album NAME
 """
 from __future__ import annotations
@@ -78,6 +83,21 @@ ALBUM_DUPES = "Video Cleanup - Duplicated & Trimmed Videos"        # every video
 ALBUM_ORIGINALS = "Video Cleanup - Original Videos"              # originals that now have a smaller copy
 ALBUM_COMPRESSED = "Video Cleanup - Compressed Versions"         # the smaller copies
 ALBUM_COMPARE = "Video Cleanup - Original & Compressed Comparison"  # each original next to its copy
+PHOTO_ALBUM_DUPES = "Photo Cleanup - Duplicate & Similar Photos"   # every photo in a duplicate set
+PHOTO_SAME_BITS = 24     # photos whose 256-bit hashes differ by <= this look the same
+COPY_SECONDS = 0.5       # …and are copies if they were also taken at the same moment
+# How strict the comparison is. Strict only finds copies; balanced and loose also
+# find similar videos, and similar photos taken within `window` seconds of each other
+# (bursts, retakes), whose hashes differ by <= `photo_bits`.
+STRICTNESS = {
+    "strict":   {"frame_bits": 6, "cover": 0.9, "poster_bits": 4, "similar": False,
+                 "photo_bits": 0, "window": 0},
+    "balanced": {"frame_bits": 8, "cover": 0.8, "poster_bits": 6, "similar": True,
+                 "photo_bits": 40, "window": 600},
+    "loose":    {"frame_bits": 10, "cover": 0.7, "poster_bits": 8, "similar": True,
+                 "photo_bits": 64, "window": 3600},
+}
+VIDEO_SIMILAR = True     # look for similar (not just copied) videos; set by the strictness
 COMPRESS_DIR = Path.home() / "Movies" / "Video Cleanup" / "Compressed"
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp", ".mts", ".webm"}
 CACHE_FILE = Path.home() / ".cache" / "video-cleanup" / "hashes.json"
@@ -89,6 +109,7 @@ GUI = os.environ.get("VIDEO_CLEANUP_GUI") == "1"
 # ---------------------------------------------------------------- model
 @dataclass
 class Video:
+    """A video, or a photo (kind == "photo") — most of the scan treats them the same."""
     id: str
     filename: str
     date: dt.datetime | None
@@ -110,6 +131,13 @@ class Video:
     edited: bool = False
     spatial: bool = False
     meta: dict = field(default_factory=dict)          # albums, title, location… for re-import
+    kind: str = "video"
+    phash: list[int] = field(default_factory=list)    # a photo's 256-bit hash, as 4 numbers
+    hash_src: str | None = None      # the smallest preview Photos has, for hashing
+    screenshot: bool = False
+    burst: bool = False
+    live: bool = False
+    raw: bool = False
 
     @property
     def cloud_only(self) -> bool:
@@ -227,6 +255,22 @@ def hash_video_frames(ff: str, path: str, duration: float) -> list[int]:
     return hashes[:DENSE_MAX]
 
 
+def photo_hash(path: str) -> list[int] | None:
+    """A photo's 256-bit difference hash, as 4 numbers, or None if it can't be read
+    or is blank. Re-saved, resized and preview copies of a photo differ by a few bits."""
+    from PIL import Image, ImageOps
+    try:
+        with Image.open(path) as im:
+            im.draft("L", (160, 160))           # JPEGs decode much faster at a reduced size
+            im = ImageOps.exif_transpose(im).convert("L")
+            px = np.asarray(im.resize((17, 16), Image.BOX), dtype=np.int16)
+    except Exception:
+        return None
+    if px.std() < 1:
+        return None
+    return [int(x) for x in np.packbits((px[:, 1:] > px[:, :-1]).flatten()).view(">u8")]
+
+
 def query_frames(frames: list[int]) -> list[int]:
     """An evenly spread subset of a video's frames, used to look it up in others."""
     if len(frames) <= MAX_FRAMES:
@@ -320,7 +364,8 @@ def parse_numbers(text: str, n: int) -> list[int] | None:
     return picked
 
 
-def choose_albums(items: list[dict], total: int, names: list[str] | None) -> list[dict] | None:
+def choose_albums(items: list[dict], total: int, names: list[str] | None,
+                  noun: str = "video") -> list[dict] | None:
     """Ask which folders and albums to scan. Returns the chosen ones, or None for everything."""
     if names:
         wanted = {n.casefold() for n in names}
@@ -332,7 +377,7 @@ def choose_albums(items: list[dict], total: int, names: list[str] | None) -> lis
         return chosen
     question = "What would you like to scan?"
     if GUI:
-        gui_send("choose", question=question, total=total,
+        gui_send("choose", question=question, total=total, noun=noun,
                  items=[{"id": i["id"], "label": i["title"], "folder": i["folder"],
                          "depth": i["depth"], "count": len(i["uuids"])} for i in items])
         ans = sys.stdin.readline().strip()
@@ -345,11 +390,11 @@ def choose_albums(items: list[dict], total: int, names: list[str] | None) -> lis
         return [i for i in items if i["id"] in ids] or None
     if not sys.stdin.isatty():
         return None
-    print(f"\n{question} Your library has {plural(total, 'video')} in these folders and albums:")
+    print(f"\n{question} Your library has {plural(total, noun)} in these folders and albums:")
     width = len(str(len(items)))
     for n, i in enumerate(items, 1):
         kind = "folder, " if i["folder"] else ""
-        print(f"  {n:>{width}}. {'   ' * i['depth']}{i['title']} ({kind}{plural(len(i['uuids']), 'video')})")
+        print(f"  {n:>{width}}. {'   ' * i['depth']}{i['title']} ({kind}{plural(len(i['uuids']), noun)})")
     while True:
         try:
             ans = input("Type the numbers to scan, separated by commas (e.g. 1, 4-6), "
@@ -365,13 +410,26 @@ def choose_albums(items: list[dict], total: int, names: list[str] | None) -> lis
             return [items[k] for k in dict.fromkeys(picked)]
 
 
-def load_from_photos(library: str | None, albums: list[str] | None = None) -> tuple[list[Video], str]:
-    """The videos to scan, and a description of where they came from for the report."""
+def photo_meta(p) -> dict:
+    """Albums, title, location… kept so a copy can be given the same details."""
+    return {
+        "albums": list(getattr(p, "albums", None) or []),
+        "title": getattr(p, "title", None) or "",
+        "description": getattr(p, "description", None) or "",
+        "keywords": list(getattr(p, "keywords", None) or []),
+        "location": tuple(getattr(p, "location", None) or (None, None)),
+    }
+
+
+def load_from_photos(library: str | None, albums: list[str] | None = None,
+                     media: str = "videos") -> tuple[list[Video], str]:
+    """The videos (or photos) to scan, and a description of where they came from for the report."""
     import osxphotos
     print("Reading your Photos library (read-only)…")
     db = osxphotos.PhotosDB(dbfile=library) if library else osxphotos.PhotosDB()
     candidates = []
-    for p in db.photos(images=False, movies=True):
+    noun = "photo" if media == "photos" else "video"
+    for p in db.photos(images=media == "photos", movies=media != "photos"):
         # Shared-album and "Shared with You" items don't use your iCloud storage.
         if getattr(p, "shared", False):
             continue
@@ -385,15 +443,17 @@ def load_from_photos(library: str | None, albums: list[str] | None = None) -> tu
 
     source = "Photos library"
     items = photos_choices(db, {p.uuid for p in candidates})
-    chosen = choose_albums(items, len(candidates), albums) if items else None
+    chosen = choose_albums(items, len(candidates), albums, noun) if items else None
     if chosen:
         keep = set().union(*(i["uuids"] for i in chosen))
         candidates = [p for p in candidates if p.uuid in keep]
         titles = [i["title"] for i in chosen]
         source = "Photos: " + (", ".join(titles) if len(titles) <= 3 else
                                f"{', '.join(titles[:3])} and {len(titles) - 3} more")
-        print(f"Scanning {plural(len(candidates), 'video')} in {', '.join(titles)}.")
+        print(f"Scanning {plural(len(candidates), noun)} in {', '.join(titles)}.")
 
+    if media == "photos":
+        return [photo_item(p) for p in candidates], source
     videos = []
     for p in candidates:
         exif = getattr(p, "exif_info", None)
@@ -420,15 +480,36 @@ def load_from_photos(library: str | None, albums: list[str] | None = None) -> tu
             fps=float(getattr(exif, "fps", None) or 0),
             edited=bool(getattr(p, "hasadjustments", False)),
             spatial=bool(getattr(p, "spatial", False)),
-            meta={
-                "albums": list(getattr(p, "albums", None) or []),
-                "title": getattr(p, "title", None) or "",
-                "description": getattr(p, "description", None) or "",
-                "keywords": list(getattr(p, "keywords", None) or []),
-                "location": tuple(getattr(p, "location", None) or (None, None)),
-            },
+            meta=photo_meta(p),
         ))
     return videos, source
+
+
+def photo_item(p) -> Video:
+    path = p.path if (p.path and os.path.exists(p.path)) else None
+    previews = sorted((d for d in (getattr(p, "path_derivatives", None) or [])
+                       if d.lower().endswith((".jpg", ".jpeg")) and os.path.exists(d)), key=os.path.getsize)
+    return Video(
+        id=p.uuid,
+        filename=p.original_filename or p.filename or p.uuid,
+        date=p.date,
+        size=int(getattr(p, "original_filesize", 0) or (os.path.getsize(path) if path else 0)),
+        duration=0.0,
+        width=int(p.width or 0),
+        height=int(p.height or 0),
+        path=path,
+        thumb_src=previews[-1] if previews else None,
+        hash_src=previews[0] if previews else None,
+        favorite=bool(p.favorite),
+        hidden=bool(getattr(p, "hidden", False)),
+        edited=bool(getattr(p, "hasadjustments", False)),
+        kind="photo",
+        screenshot=bool(getattr(p, "screenshot", False)),
+        burst=bool(getattr(p, "burst", False)),
+        live=bool(getattr(p, "live_photo", False)),
+        raw=bool(getattr(p, "has_raw", False) or getattr(p, "israw", False)),
+        meta=photo_meta(p),
+    )
 
 
 def norm_codec(c: str | None) -> str:
@@ -566,6 +647,48 @@ def fingerprint_all(videos: list[Video], ff: str, download_missing: bool) -> Non
     _store(cache, videos)
 
 
+def fingerprint_photos(photos: list[Video]) -> None:
+    """Hash each photo from Photos' smallest preview (which also exists for photos stored
+    only in iCloud), or from the original if there's no preview."""
+    cache = load_cache()
+    todo = []
+    for v in photos:
+        c = cache.get("photo|" + cache_key(v))
+        if c and c.get("phash"):
+            v.phash = c["phash"]
+        else:
+            todo.append(v)
+    if len(photos) - len(todo):
+        print(f"  {len(photos) - len(todo)} photos already checked on a previous run")
+
+    def work(v: Video) -> Video:
+        for src in dict.fromkeys(x for x in (v.hash_src, v.path) if x):
+            h = photo_hash(src)
+            if h:
+                v.phash = h
+                break
+        return v
+
+    def store(vs: list[Video]) -> None:
+        for v in vs:
+            if v.phash:
+                cache["photo|" + cache_key(v)] = {"phash": v.phash}
+        save_cache(cache)
+
+    if todo:
+        print(f"Fingerprinting {plural(len(todo), 'photo')}…")
+        with cf.ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 4)) as ex:
+            for i, _ in enumerate(ex.map(work, todo), 1):
+                if i % 25 == 0 or i == len(todo):
+                    progress("Fingerprinting", i, len(todo))
+                if i % 1000 == 0:
+                    store(todo[:i])
+        store(todo)
+    missing = sum(1 for v in photos if not v.phash)
+    if missing:
+        print(f"  {plural(missing, 'photo')} couldn't be read, so they're left out")
+
+
 def _store(cache: dict, vids: list[Video]) -> None:
     for v in vids:
         if v.frames or v.poster is not None:
@@ -636,8 +759,53 @@ def find_matches(videos: list[Video]) -> dict[tuple[int, int], str]:
                 add(i, j, "same")
             elif vi.duration and vj.duration and vi.duration < 0.9 * vj.duration:
                 add(i, j, "trimmed")      # i is a shorter piece of j
-            else:
+            elif VIDEO_SIMILAR:
                 add(i, j, "similar")
+    return edges
+
+
+def find_photo_matches(photos: list[Video], level: str) -> dict[tuple[int, int], str]:
+    """Return {(i, j): kind} with i < j. A photo is only called a copy (to delete) when
+    there's evidence: the identical file, or the same picture taken at the same moment.
+    Bursts and retakes look just as alike, so everything else is only for review:
+      identical  same file size and dimensions, and looks the same
+      same       looks the same and was taken at the same moment (re-saved or resized)
+      similar    looks alike and was taken within the strictness window (bursts, retakes)
+      lookalike  looks the same but was taken at a very different time (or has no date)"""
+    cfg = STRICTNESS[level]
+    idx = [i for i, v in enumerate(photos) if v.phash]
+    if len(idx) < 2:
+        return {}
+    H = np.array([photos[i].phash for i in idx], dtype=np.uint64)
+    T = np.array([photos[i].date.timestamp() if photos[i].date else np.nan for i in idx])
+    limit = max(PHOTO_SAME_BITS, cfg["photo_bits"])
+    edges = {}
+    step = max(1, len(idx) // 200)
+    for r in range(len(idx) - 1):
+        dist = popcount64(H[r + 1:] ^ H[r]).sum(axis=1)
+        for h in np.nonzero(dist <= limit)[0]:
+            a, b = photos[idx[r]], photos[idx[r + 1 + h]]
+            d = int(dist[h])
+            dt_ = abs(T[r] - T[r + 1 + h])            # nan if either has no date
+            soon = bool(dt_ <= cfg["window"])
+            if d <= PHOTO_SAME_BITS:
+                if a.size and a.size == b.size and (a.width, a.height) == (b.width, b.height):
+                    kind = "identical"
+                elif dt_ <= COPY_SECONDS and not (a.burst or b.burst):
+                    kind = "same"
+                elif soon:
+                    kind = "similar"
+                elif not dt_ <= 3600:                 # far apart in time, or no date
+                    kind = "lookalike"
+                else:
+                    continue
+            elif soon:
+                kind = "similar"
+            else:
+                continue
+            edges[(idx[r], idx[r + 1 + h])] = kind
+        if r % step == 0 or r == len(idx) - 2:
+            progress("Comparing", r + 1, len(idx) - 1)
     return edges
 
 
@@ -650,6 +818,15 @@ class Group:
     def saving(self, videos):
         return sum(videos[i].size for i, (a, _) in self.action.items() if a == "delete")
 
+
+PHOTO_REASONS = {
+    "identical": "Identical copy of the one marked Keep",
+    "same": "Same photo as the one marked Keep, saved again or resized",
+    "similar": "A similar shot taken around the same time — check before deleting",
+    "lookalike": "Looks the same as the one marked Keep but has a different date — check it's a copy",
+    "linked": "Looks like another photo in this set — check before deleting",
+}
+DELETABLE = ("identical", "same", "trimmed")
 
 REASONS = {
     "identical": "Identical copy of the one marked Keep",
@@ -680,9 +857,13 @@ def build_groups(videos: list[Video], edges) -> list[Group]:
     groups = []
     for members in clusters.values():
         # keep the most complete, best quality copy; favourites win ties
-        keeper = max(members, key=lambda k: (
-            round(videos[k].duration or 0), videos[k].pixels, videos[k].favorite,
-            not videos[k].cloud_only, videos[k].size))
+        def quality(k: int) -> tuple:
+            v = videos[k]
+            if v.kind == "photo":
+                return (v.pixels, v.raw, v.favorite, v.edited, v.live, not v.cloud_only, v.size)
+            return (round(v.duration or 0), v.pixels, v.favorite, not v.cloud_only, v.size)
+        keeper = max(members, key=quality)
+        reasons = PHOTO_REASONS if videos[keeper].kind == "photo" else REASONS
         action = {}
         for m in members:
             if m == keeper:
@@ -690,18 +871,72 @@ def build_groups(videos: list[Video], edges) -> list[Group]:
             kind = edges.get((min(m, keeper), max(m, keeper)))
             if kind == "trimmed" and videos[m].duration > videos[keeper].duration:
                 kind = "similar"
-            if kind in ("identical", "same", "trimmed") and not videos[m].favorite:
-                action[m] = ("delete", REASONS[kind])
-            elif kind in ("identical", "same", "trimmed"):
-                action[m] = ("review", REASONS[kind] + " (but it's a favourite)")
+            if kind in DELETABLE and not videos[m].favorite:
+                action[m] = ("delete", reasons[kind])
+            elif kind in DELETABLE:
+                action[m] = ("review", reasons[kind] + " (but it's a favourite)")
             else:
-                action[m] = ("review", REASONS["similar"])
+                action[m] = ("review", reasons.get(kind) or reasons.get("linked", reasons["similar"]))
         groups.append(Group(members, keeper, action))
     groups.sort(key=lambda g: (-g.saving(videos), -len(g.members)))
     return groups
 
 
 # ---------------------------------------------------------------- report
+REPORT_CSS = """:root { --bg:#f6f5f2; --panel:#fff; --ink:#1d1d1f; --mute:#6e6e73; --line:#e3e1dc;
+  --keep:#1f7a4d; --del:#c2410c; --rev:#a16207; --accent:#2f5bea; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141416; --panel:#1f1f22; --ink:#f2f2f4;
+  --mute:#a1a1a8; --line:#33333a; --keep:#4ade80; --del:#fb923c; --rev:#facc15; --accent:#7c9cff; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+  font:15px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; }
+main { max-width:1180px; margin:0 auto; padding:32px 20px 80px; }
+h1 { font-size:30px; letter-spacing:-.02em; margin:0 0 4px; }
+.sub { color:var(--mute); margin:0 0 24px; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:20px; }
+.stat { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+.stat .n { font-size:26px; font-weight:650; letter-spacing:-.02em; }
+.stat .l { color:var(--mute); font-size:13px; }
+.stat.hi .n { color:var(--del); }
+.callout { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--accent);
+  border-radius:10px; padding:12px 16px; margin:0 0 28px; }
+nav { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:28px; position:sticky; top:0; padding:10px 0;
+  background:var(--bg); z-index:2; }
+nav a { color:var(--ink); text-decoration:none; border:1px solid var(--line); background:var(--panel);
+  padding:6px 12px; border-radius:999px; font-size:14px; }
+nav a:hover { border-color:var(--accent); }
+h2 { font-size:21px; margin:36px 0 4px; letter-spacing:-.01em; }
+.lead { color:var(--mute); margin:0 0 16px; max-width:760px; }
+.group { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+.group h3 { margin:0 0 10px; font-size:14px; font-weight:500; color:var(--mute); }
+.group h3 span { color:var(--ink); font-weight:600; }
+.group h3 b { color:var(--del); }
+.row { display:flex; gap:12px; overflow-x:auto; padding-bottom:4px; }
+.row .card { flex:0 0 210px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+.card.keep { border-color:var(--keep); }
+.card.delete { border-color:var(--del); }
+.thumb { position:relative; aspect-ratio:4/3; background:#000; }
+.thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+.noimg { color:#999; display:grid; place-items:center; height:100%; font-size:13px; }
+.dur { position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,.65); color:#fff;
+  font-size:12px; padding:1px 6px; border-radius:6px; font-variant-numeric:tabular-nums; }
+.badge { position:absolute; left:6px; top:6px; color:#fff; font-size:12px; font-weight:650;
+  padding:2px 8px; border-radius:6px; }
+.badge.keep { background:#1f7a4d; } .badge.delete { background:#c2410c; } .badge.review { background:#a16207; }
+.meta { padding:8px 10px 10px; }
+.size { font-weight:650; font-variant-numeric:tabular-nums; }
+.when, .fn { color:var(--mute); font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tags { margin-top:6px; display:flex; gap:4px; flex-wrap:wrap; }
+.tag { font-size:11px; border:1px solid var(--line); border-radius:999px; padding:0 7px; color:var(--mute); }
+.tag.fav { color:var(--rev); border-color:var(--rev); }
+.note { font-size:12.5px; margin-top:6px; }
+.empty { color:var(--mute); }
+footer { color:var(--mute); font-size:13px; margin-top:48px; }
+"""
+
+
 def make_thumb(v: Video, ff: str, out_dir: Path) -> str | None:
     from PIL import Image
     dest = out_dir / "thumbs" / f"{v.id}.jpg"
@@ -709,9 +944,11 @@ def make_thumb(v: Video, ff: str, out_dir: Path) -> str | None:
         return f"thumbs/{dest.name}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if v.thumb_src:
-            with Image.open(v.thumb_src) as im:
-                im = im.convert("RGB")
+        src = v.thumb_src or (v.path if v.kind == "photo" else None)
+        if src:
+            from PIL import ImageOps
+            with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
                 im.thumbnail((360, 360))
                 im.save(dest, quality=80)
             return f"thumbs/{dest.name}"
@@ -744,11 +981,20 @@ def card(v: Video, thumb: str | None, badge: str = "", note: str = "") -> str:
         tags.append('<span class="tag">Time-lapse</span>')
     if v.hidden:
         tags.append('<span class="tag">Hidden</span>')
+    for flag, label in ((v.live, "Live"), (v.burst, "Burst"), (v.raw, "RAW"),
+                        (v.screenshot, "Screenshot"), (v.kind == "photo" and v.edited, "Edited")):
+        if flag:
+            tags.append(f'<span class="tag">{label}</span>')
     when = v.date.strftime("%-d %b %Y, %H:%M") if v.date else "Unknown date"
-    res = f"{min(v.width, v.height)}p" if v.width and v.height else ""
+    if v.kind == "photo":
+        res = f"{v.pixels / 1e6:.0f} MP" if v.pixels >= 1e6 else (f"{v.width}×{v.height}" if v.pixels else "")
+        corner = ""
+    else:
+        res = f"{min(v.width, v.height)}p" if v.width and v.height else ""
+        corner = f'<span class="dur">{human_dur(v.duration)}</span>'
     badge_html = f'<span class="badge {badge.lower()}">{e(badge)}</span>' if badge else ""
     return f"""<div class="card {badge.lower()}">
-  <div class="thumb">{img}{badge_html}<span class="dur">{human_dur(v.duration)}</span></div>
+  <div class="thumb">{img}{badge_html}{corner}</div>
   <div class="meta">
     <div class="size">{human_size(v.size)}</div>
     <div class="when">{e(when)}</div>
@@ -759,9 +1005,117 @@ def card(v: Video, thumb: str | None, badge: str = "", note: str = "") -> str:
 </div>"""
 
 
+def group_sections(videos: list[Video], groups: list[Group], thumbs: dict) -> str:
+    """The report's duplicate sets: Keep first, then Delete, then Review."""
+    photo = bool(videos) and videos[0].kind == "photo"
+    html_ = []
+    for n, g in enumerate(groups, 1):
+        order = [g.keeper] + sorted((m for m in g.members if m != g.keeper),
+                                    key=lambda m: (g.action[m][0] != "delete", -videos[m].size))
+        cards = []
+        for m in order:
+            if m == g.keeper:
+                cards.append(card(videos[m], thumbs.get(m), "Keep", "Best copy: highest resolution"
+                                  if photo else "Best copy: longest and highest quality"))
+            else:
+                act, why = g.action[m]
+                cards.append(card(videos[m], thumbs.get(m), "Delete" if act == "delete" else "Review", why))
+        sv = g.saving(videos)
+        head = f"Frees {human_size(sv)}" if sv else "Check these"
+        html_.append(f'<section class="group"><h3><span>Set {n}</span> · '
+                     f'{plural(len(g.members), "photo" if photo else "video")} · <b>{head}</b></h3>'
+                     f'<div class="row">{"".join(cards)}</div></section>')
+    return "".join(html_)
+
+
+def write_photo_report(photos: list[Video], groups: list[Group], ff: str, out_dir: Path,
+                       source_label: str, albums_made: bool) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    biggest = sorted(range(len(photos)), key=lambda i: -photos[i].size)[:BIGGEST_COUNT]
+    shots = sorted([i for i, v in enumerate(photos) if v.screenshot], key=lambda i: -photos[i].size)
+    needed = sorted({m for g in groups for m in g.members} | set(biggest) | set(shots))
+    thumbs = {}
+    for n, i in enumerate(needed, 1):
+        thumbs[i] = make_thumb(photos[i], ff, out_dir)
+        if n % 25 == 0 or n == len(needed):
+            progress("Previews", n, len(needed))
+
+    total = sum(v.size for v in photos)
+    saving = sum(g.saving(photos) for g in groups)
+    n_delete = sum(1 for g in groups for a, _ in g.action.values() if a == "delete")
+    n_review = sum(1 for g in groups for a, _ in g.action.values() if a == "review")
+    shots_size = sum(photos[i].size for i in shots)
+    unread = sum(1 for v in photos if not v.phash)
+    e = html.escape
+
+    def grid(idx):
+        if not idx:
+            return '<p class="empty">Nothing here.</p>'
+        return '<div class="grid">' + "".join(card(photos[i], thumbs.get(i)) for i in idx) + "</div>"
+
+    albums_note = (f"""<div class="callout"><b>Album added in Photos.</b> Look for
+      <i>{e(PHOTO_ALBUM_DUPES)}</i> under Albums on your Mac or iPhone. It has every photo
+      from the sets below, set by set, with the one marked Keep first. Check them, select the
+      ones you don't want and choose <b>Delete</b> (not “Remove from Album”).
+      Then empty <b>Recently Deleted</b> to free the iCloud space.</div>""" if albums_made else
+                   """<div class="callout">Tip: run the tool again and answer <b>yes</b> to
+      “create an album in Photos” to get these photos collected in an album you can open on your iPhone.</div>""")
+    now = dt.datetime.now().strftime("%-d %b %Y, %H:%M")
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Photo Cleanup</title>
+<style>
+{REPORT_CSS}</style></head><body><main>
+<h1>Photo Cleanup</h1>
+<p class="sub">{e(source_label)} · scanned {now} · nothing has been deleted</p>
+<div class="stats">
+  <div class="stat"><div class="n">{len(photos):,}</div><div class="l">photos · {human_size(total)}</div></div>
+  <div class="stat hi"><div class="n">{human_size(saving)}</div><div class="l">could be freed by {plural(n_delete, "copy").replace("copys", "copies")}</div></div>
+  <div class="stat"><div class="n">{n_review}</div><div class="l">similar shots to check</div></div>
+  <div class="stat"><div class="n">{human_size(shots_size)}</div><div class="l">in {plural(len(shots), "screenshot")}</div></div>
+</div>
+{albums_note}
+<nav><a href="#dupes">Duplicates and similar ({len(groups)} sets)</a><a href="#big">Biggest</a>
+<a href="#screenshots">Screenshots</a><a href="#about">How this works</a></nav>
+
+<h2 id="dupes">Duplicates and similar shots</h2>
+<p class="lead">Each set is a group of photos that look alike. <b>Keep</b> is the highest-resolution copy
+(favourites win ties). <b>Delete</b> marks copies of it: the identical file, or the same picture re-saved
+or resized. <b>Review</b> marks photos that only look alike, such as bursts and retakes, so you choose
+which to keep.</p>
+{group_sections(photos, groups, thumbs) or '<p class="empty">No duplicates or similar photos found.</p>'}
+
+<h2 id="big">Biggest photos</h2>
+<p class="lead">Your {len(biggest)} largest photos. RAW and very high-resolution photos take the most
+space, so these are worth a look even if they're not duplicates.</p>
+{grid(biggest)}
+
+<h2 id="screenshots">Screenshots</h2>
+<p class="lead">{plural(len(shots), "screenshot")} using {human_size(shots_size)}. Screenshots are
+often only needed for a short while.</p>
+{grid(shots)}
+
+<h2 id="about">How this works</h2>
+<p class="lead">The tool takes a fingerprint of each photo from the small preview Photos keeps
+(so photos stored only in iCloud are checked too) and compares every photo with every other one.
+A photo is only marked <b>Delete</b> when it's clearly a copy: the identical file, or the same
+picture taken at the same moment. Photos that look the same but have different dates, such as
+ones saved from a message, are marked <b>Review</b>.
+{f"{plural(unread, 'photo')} couldn't be read, so they were left out." if unread else ""}
+Deleting a photo moves it to Recently Deleted. The iCloud space is only freed once it leaves there,
+either after 30 days or when you empty it.</p>
+<footer>Video Cleanup only reads your library. Thumbnails are stored next to this page.</footer>
+</main></body></html>"""
+    out = out_dir / "index.html"
+    out.write_text(page, encoding="utf-8")
+    return out
+
+
 def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Path,
                  source_label: str, albums_made: bool, from_photos: bool = True,
                  cands: list | None = None, comp_result: dict | None = None) -> Path:
+    if videos and videos[0].kind == "photo":
+        return write_photo_report(videos, groups, ff, out_dir, source_label, albums_made)
     out_dir.mkdir(parents=True, exist_ok=True)
     needed = set()
     for g in groups:
@@ -817,22 +1171,6 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
     else:
         comp_status = ""
 
-    group_html = []
-    for n, g in enumerate(groups, 1):
-        order = [g.keeper] + sorted((m for m in g.members if m != g.keeper),
-                                    key=lambda m: (g.action[m][0] != "delete", -videos[m].size))
-        cards = []
-        for m in order:
-            if m == g.keeper:
-                cards.append(card(videos[m], thumbs.get(m), "Keep", "Best copy: longest and highest quality"))
-            else:
-                act, why = g.action[m]
-                cards.append(card(videos[m], thumbs.get(m), "Delete" if act == "delete" else "Review", why))
-        sv = g.saving(videos)
-        head = f"Frees {human_size(sv)}" if sv else "Check these"
-        group_html.append(f'<section class="group"><h3><span>Set {n}</span> · {len(g.members)} videos · <b>{head}</b></h3>'
-                          f'<div class="row">{"".join(cards)}</div></section>')
-
     def grid(idx, note_fn=None):
         if not idx:
             return '<p class="empty">Nothing here.</p>'
@@ -857,58 +1195,7 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Video Cleanup</title>
 <style>
-:root {{ --bg:#f6f5f2; --panel:#fff; --ink:#1d1d1f; --mute:#6e6e73; --line:#e3e1dc;
-  --keep:#1f7a4d; --del:#c2410c; --rev:#a16207; --accent:#2f5bea; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --bg:#141416; --panel:#1f1f22; --ink:#f2f2f4;
-  --mute:#a1a1a8; --line:#33333a; --keep:#4ade80; --del:#fb923c; --rev:#facc15; --accent:#7c9cff; }} }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--ink);
-  font:15px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; }}
-main {{ max-width:1180px; margin:0 auto; padding:32px 20px 80px; }}
-h1 {{ font-size:30px; letter-spacing:-.02em; margin:0 0 4px; }}
-.sub {{ color:var(--mute); margin:0 0 24px; }}
-.stats {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:20px; }}
-.stat {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px 16px; }}
-.stat .n {{ font-size:26px; font-weight:650; letter-spacing:-.02em; }}
-.stat .l {{ color:var(--mute); font-size:13px; }}
-.stat.hi .n {{ color:var(--del); }}
-.callout {{ background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--accent);
-  border-radius:10px; padding:12px 16px; margin:0 0 28px; }}
-nav {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:28px; position:sticky; top:0; padding:10px 0;
-  background:var(--bg); z-index:2; }}
-nav a {{ color:var(--ink); text-decoration:none; border:1px solid var(--line); background:var(--panel);
-  padding:6px 12px; border-radius:999px; font-size:14px; }}
-nav a:hover {{ border-color:var(--accent); }}
-h2 {{ font-size:21px; margin:36px 0 4px; letter-spacing:-.01em; }}
-.lead {{ color:var(--mute); margin:0 0 16px; max-width:760px; }}
-.group {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }}
-.group h3 {{ margin:0 0 10px; font-size:14px; font-weight:500; color:var(--mute); }}
-.group h3 span {{ color:var(--ink); font-weight:600; }}
-.group h3 b {{ color:var(--del); }}
-.row {{ display:flex; gap:12px; overflow-x:auto; padding-bottom:4px; }}
-.row .card {{ flex:0 0 210px; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; }}
-.card {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }}
-.card.keep {{ border-color:var(--keep); }}
-.card.delete {{ border-color:var(--del); }}
-.thumb {{ position:relative; aspect-ratio:4/3; background:#000; }}
-.thumb img {{ width:100%; height:100%; object-fit:cover; display:block; }}
-.noimg {{ color:#999; display:grid; place-items:center; height:100%; font-size:13px; }}
-.dur {{ position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,.65); color:#fff;
-  font-size:12px; padding:1px 6px; border-radius:6px; font-variant-numeric:tabular-nums; }}
-.badge {{ position:absolute; left:6px; top:6px; color:#fff; font-size:12px; font-weight:650;
-  padding:2px 8px; border-radius:6px; }}
-.badge.keep {{ background:#1f7a4d; }} .badge.delete {{ background:#c2410c; }} .badge.review {{ background:#a16207; }}
-.meta {{ padding:8px 10px 10px; }}
-.size {{ font-weight:650; font-variant-numeric:tabular-nums; }}
-.when, .fn {{ color:var(--mute); font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.tags {{ margin-top:6px; display:flex; gap:4px; flex-wrap:wrap; }}
-.tag {{ font-size:11px; border:1px solid var(--line); border-radius:999px; padding:0 7px; color:var(--mute); }}
-.tag.fav {{ color:var(--rev); border-color:var(--rev); }}
-.note {{ font-size:12.5px; margin-top:6px; }}
-.empty {{ color:var(--mute); }}
-footer {{ color:var(--mute); font-size:13px; margin-top:48px; }}
-</style></head><body><main>
+{REPORT_CSS}</style></head><body><main>
 <h1>Video Cleanup</h1>
 <p class="sub">{html.escape(source_label)} · scanned {now} · nothing has been deleted</p>
 <div class="stats">
@@ -926,7 +1213,7 @@ footer {{ color:var(--mute); font-size:13px; margin-top:48px; }}
 <p class="lead">Each set is a group of videos with the same content. <b>Keep</b> is the most complete,
 highest-quality copy. <b>Delete</b> marks copies whose content is all in the kept one. <b>Review</b>
 marks videos that look alike but might be different moments, so you decide.</p>
-{''.join(group_html) or '<p class="empty">No duplicates found.</p>'}
+{group_sections(videos, groups, thumbs) or '<p class="empty">No duplicates found.</p>'}
 
 <h2 id="big">Biggest videos</h2>
 <p class="lead">Your {len(biggest)} largest videos. Long or 4K clips take the most space, so
@@ -1487,9 +1774,9 @@ def import_copies(videos: list[Video], done: list[tuple[int, str]]) -> int:
 
 
 # ---------------------------------------------------------------- albums
-def make_albums(videos: list[Video], groups: list[Group]) -> bool:
+def make_albums(videos: list[Video], groups: list[Group], name: str = ALBUM_DUPES) -> bool:
     import photoscript
-    # every video in the "Duplicates and trimmed copies" section, set by set,
+    # every video (or photo) in the report's duplicates section, set by set,
     # in the same order as the report (Keep first, then Delete, then Review)
     dupes = []
     for g in groups:
@@ -1497,10 +1784,10 @@ def make_albums(videos: list[Video], groups: list[Group]) -> bool:
                                     key=lambda m: (g.action[m][0] != "delete", -videos[m].size))
         dupes.extend(videos[m].id for m in order)
     lib = photos_library()
-    album = lib.album(ALBUM_DUPES) or lib.create_album(ALBUM_DUPES)
+    album = lib.album(name) or lib.create_album(name)
     for k in range(0, len(dupes), 50):
         album.add([photoscript.Photo(u) for u in dupes[k:k + 50]])
-    print(f"  Album “{ALBUM_DUPES}”: {len(dupes)} videos")
+    print(f"  Album “{name}”: {plural(len(dupes), videos[0].kind if videos else 'video')}")
     return True
 
 # ---------------------------------------------------------------- main
@@ -1526,7 +1813,7 @@ def ask_choice(question: str, options: tuple[str, ...], default: str,
 
 def ask(question: str, default: bool = False) -> bool:
     if GUI:
-        gui_send("ask", question=question, buttons=["Yes", "No"], default="Yes" if default else "No")
+        gui_send("ask", question=question, buttons=["No", "Yes"], default="Yes" if default else "No")
         ans = sys.stdin.readline().strip()
         return default if not ans else ans == "Yes"
     if not sys.stdin.isatty():
@@ -1539,6 +1826,73 @@ def ask(question: str, default: bool = False) -> bool:
     return default if not ans else ans.startswith("y")
 
 
+def ask_media(given: str | None) -> str:
+    if given:
+        return given
+    ans = ask_choice("What would you like to clean up?" if GUI else
+                     "What would you like to clean up? Type v for videos or p for photos",
+                     ("v", "p"), "v", ("Videos", "Photos"))
+    return {"v": "videos", "p": "photos"}[ans]
+
+
+def ask_strictness(given: str | None, media: str) -> str:
+    if given:
+        return given
+    if media == "photos":
+        print("\n  Strict: only copies of the same photo (identical files, and re-saved or resized copies).")
+        print("  Balanced: copies, plus near-identical shots taken within 10 minutes (bursts, retakes).")
+        print("  Loose: copies, plus similar-looking shots taken within an hour. More to review.")
+    else:
+        print("\n  Strict: only copies (identical files, re-saved copies and trimmed clips).")
+        print("  Balanced: copies, plus videos that look very similar.")
+        print("  Loose: copies, plus videos that look alike. More to review.")
+    ans = ask_choice("How strict should the comparison be?" if GUI else
+                     "How strict should the comparison be? Type s, b or l", ("s", "b", "l"), "b",
+                     ("Strict", "Balanced", "Loose"))
+    return {"s": "strict", "b": "balanced", "l": "loose"}[ans]
+
+
+def apply_strictness(level: str) -> None:
+    global FRAME_MATCH_BITS, COVER_THRESHOLD, POSTER_MATCH_BITS, VIDEO_SIMILAR
+    cfg = STRICTNESS[level]
+    FRAME_MATCH_BITS, COVER_THRESHOLD = cfg["frame_bits"], cfg["cover"]
+    POSTER_MATCH_BITS, VIDEO_SIMILAR = cfg["poster_bits"], cfg["similar"]
+
+
+def clean_up_photos(photos: list[Video], source: str, level: str, args, ff: str, t0: float) -> None:
+    """The photo version of the scan: fingerprint, group, album, report. (No compressing.)"""
+    fingerprint_photos(photos)
+    print("Looking for matches…")
+    groups = build_groups(photos, find_photo_matches(photos, level))
+    saving = sum(g.saving(photos) for g in groups)
+    n_delete = sum(1 for g in groups for a, _ in g.action.values() if a == "delete")
+    n_review = sum(1 for g in groups for a, _ in g.action.values() if a == "review")
+    print(f"\nFound {len(groups)} sets of duplicate or similar photos. Deleting {n_delete} suggested "
+          f"copies would free {human_size(saving)}, and {n_review} more are worth a look.")
+
+    albums_made = False
+    if groups:
+        want = args.make_albums
+        if want is None:
+            want = ask("Create an album in Photos with these duplicate and similar photos, "
+                       "so you can check and delete them on your iPhone?", True)
+        if want:
+            print("Adding the album in Photos (Photos will open; allow "
+                  f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
+        if want and can_control_photos():
+            try:
+                albums_made = make_albums(photos, groups, PHOTO_ALBUM_DUPES)
+            except Exception as exc:
+                print(f"  Couldn't create the album: {exc}")
+
+    out_dir = Path(args.out or Path.home() / "Desktop" / "Photo Cleanup Report").expanduser()
+    out = write_report(photos, groups, ff, out_dir, source, albums_made, True)
+    print(f"\nReport: {out}")
+    print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
+    if not args.no_open:
+        webbrowser.open(out.as_uri())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--folder", help="scan a folder of video files instead of the Photos library")
@@ -1546,7 +1900,11 @@ def main() -> None:
     ap.add_argument("--album", action="append", metavar="NAME",
                     help="only scan this album or folder in Photos (can be given more than once); "
                          "without it you're asked which to scan")
-    ap.add_argument("--out", default=str(Path.home() / "Desktop" / "Video Cleanup Report"))
+    ap.add_argument("--media", choices=["videos", "photos"],
+                    help="clean up videos or photos (without it you're asked)")
+    ap.add_argument("--strictness", choices=list(STRICTNESS),
+                    help="how alike things must be to count (without it you're asked)")
+    ap.add_argument("--out", help="where to save the report (default: a folder on your Desktop)")
     dl = ap.add_mutually_exclusive_group()
     dl.add_argument("--download-missing", action="store_true", default=None,
                     help="temporarily download iCloud-only videos for a full check")
@@ -1570,9 +1928,11 @@ def main() -> None:
     if use_photos and sys.platform != "darwin":
         sys.exit("Reading the Photos library only works on a Mac. Use --folder to scan a folder.")
 
+    media = ask_media(args.media) if use_photos else "videos"
+    noun = "photo" if media == "photos" else "video"
     if use_photos:
         try:
-            videos, source = load_from_photos(args.library, args.album)
+            videos, source = load_from_photos(args.library, args.album, media)
         except Exception as exc:
             msg = str(exc)
             print(f"\nCouldn't read the Photos library: {msg}")
@@ -1590,10 +1950,16 @@ def main() -> None:
     #     source = f"Folder {args.folder}"
 
     if not videos:
-        sys.exit("No videos found.")
+        sys.exit(f"No {noun}s found.")
     total = sum(v.size for v in videos)
     cloud = [v for v in videos if v.cloud_only]
-    print(f"Found {len(videos)} videos using {human_size(total)}.")
+    print(f"Found {plural(len(videos), noun)} using {human_size(total)}.")
+
+    level = ask_strictness(args.strictness, media)
+    apply_strictness(level)
+    if media == "photos":
+        clean_up_photos(videos, source, level, args, ff, t0)
+        return
 
     download = args.download_missing
     if use_photos and cloud and download is None:
@@ -1686,7 +2052,8 @@ def main() -> None:
                 "dir": str(Path(args.compress_dir).expanduser()),
             }
 
-    out = write_report(videos, groups, ff, Path(args.out).expanduser(), source, albums_made, use_photos,
+    out_dir = Path(args.out or Path.home() / "Desktop" / "Video Cleanup Report").expanduser()
+    out = write_report(videos, groups, ff, out_dir, source, albums_made, use_photos,
                        cands, comp_result)
     print(f"\nReport: {out}")
     print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
