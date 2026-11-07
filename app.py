@@ -221,6 +221,17 @@ class App:
                     self.proc.stdin.flush()
                 except OSError:
                     pass
+        elif kind == "choose":
+            answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)))
+            self.context = []
+            if answer == "cancel":
+                self.stopping = True
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write(answer + "\n")
+                    self.proc.stdin.flush()
+                except OSError:
+                    pass
         elif kind == "full_disk_access":
             self.needs_fda = True
 
@@ -306,6 +317,97 @@ class App:
         win.bind("<Return>", lambda e: choose(default))
         win.bind("<Escape>", lambda e: choose(default))
         win.protocol("WM_DELETE_WINDOW", lambda: choose(default))
+        self.show_modal(win)
+        return answer[0]
+
+    def choose(self, question: str, items: list[dict], total: int) -> str:
+        """Pick everything, or tick folders and albums. Returns "all", "cancel",
+        or a JSON list of the ticked items' ids."""
+        tk, ttk = self.tk, self.ttk
+        answer = ["cancel"]
+        self.asking = True
+        win = tk.Toplevel(self.root)
+        win.title(APP_NAME)
+        win.transient(self.root)
+        win.geometry("520x480")
+        win.minsize(420, 320)
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=question, font=self.bold).pack(anchor="w")
+        mode = tk.StringVar(value="all")
+        ttk.Radiobutton(body, text=f"Everything in my library ({total:,} videos)", variable=mode,
+                        value="all").pack(anchor="w", pady=(10, 2))
+        ttk.Radiobutton(body, text="Only the folders and albums I tick:", variable=mode,
+                        value="some").pack(anchor="w")
+
+        # a scrollable list of tick boxes, indented to show what's inside each folder
+        box = ttk.Frame(body)
+        box.pack(fill="both", expand=True, pady=(6, 0))
+        canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0)
+        scroll = ttk.Scrollbar(box, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta if abs(e.delta) < 20
+                                                               else -e.delta // 120, "units"))
+
+        ticks = [tk.BooleanVar(value=False) for _ in items]
+
+        def toggled(k: int) -> None:
+            mode.set("some")
+            if items[k].get("folder"):         # a folder ticks or unticks what's inside it
+                for j in range(k + 1, len(items)):
+                    if items[j].get("depth", 0) <= items[k].get("depth", 0):
+                        break
+                    ticks[j].set(ticks[k].get())
+            if not ticks[k].get():             # and a folder can't stay ticked without it
+                depth = items[k].get("depth", 0)
+                for j in range(k - 1, -1, -1):
+                    if items[j].get("depth", 0) < depth:
+                        ticks[j].set(False)
+                        depth = items[j].get("depth", 0)
+
+        for k, item in enumerate(items):
+            count = int(item.get("count", 0))
+            text = f"{item.get('label', '')}  ({count:,} video{'' if count == 1 else 's'})"
+            row = ttk.Frame(inner)
+            row.pack(anchor="w", padx=(20 * int(item.get("depth", 0)), 0), pady=1)
+            ttk.Checkbutton(row, variable=ticks[k], command=lambda k=k: toggled(k)).pack(side="left")
+            ttk.Label(row, text=text, font=self.bold if item.get("folder") else None).pack(side="left")
+
+        note = ttk.Label(body, text="")
+        note.pack(anchor="w", pady=(6, 0))
+
+        def scan() -> None:
+            if mode.get() == "all":
+                answer[0] = "all"
+            else:
+                picked = [item.get("id") for item, t in zip(items, ticks) if t.get()]
+                if not picked:
+                    note.configure(text="Tick at least one folder or album, or choose Everything.")
+                    return
+                answer[0] = json.dumps(picked)
+            win.destroy()
+
+        def cancel() -> None:
+            answer[0] = "cancel"
+            win.destroy()
+
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Scan", command=scan, default="active").pack(side="right", padx=(8, 0))
+        ttk.Button(row, text="Cancel", command=cancel).pack(side="right")
+        win.bind("<Return>", lambda e: scan())
+        win.bind("<Escape>", lambda e: cancel())
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self.show_modal(win)
+        return answer[0]
+
+    def show_modal(self, win) -> None:
+        """Bring a dialog to the front and wait until it's closed."""
         self.root.deiconify()
         self.root.lift()
         win.lift()
@@ -314,7 +416,6 @@ class App:
         self.root.bell()
         self.root.wait_window(win)
         self.asking = False
-        return answer[0]
 
     def ask_for_fda(self) -> None:
         steps = [

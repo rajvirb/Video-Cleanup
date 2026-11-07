@@ -29,7 +29,7 @@ Usage
   uv run video_cleanup.py                 # scan your Photos library
   uv run video_cleanup.py --folder DIR    # scan a folder of video files instead
   options: --download-missing / --no-download, --make-albums / --no-albums,
-           --out DIR, --library PATH
+           --out DIR, --library PATH, --album NAME
 """
 from __future__ import annotations
 
@@ -277,11 +277,99 @@ def cache_key(v: Video) -> str:
 
 
 # ---------------------------------------------------------------- loading
-def load_from_photos(library: str | None) -> list[Video]:
+def photos_choices(db, wanted: set[str]) -> list[dict]:
+    """Photos' folders and albums that hold any of the wanted videos, in sidebar
+    order (folders, then albums, alphabetically), each with the uuids of the
+    wanted videos inside it. A folder holds everything in its albums and subfolders."""
+    def key(x):
+        return (x.title or "").casefold()
+
+    def album(a, depth: int) -> dict:
+        return {"id": a.uuid, "title": a.title or "Untitled album", "folder": False,
+                "depth": depth, "uuids": {p.uuid for p in a.photos} & wanted}
+
+    def folder(f, depth: int) -> list[dict]:
+        inside = [i for sub in sorted(f.subfolders, key=key) for i in folder(sub, depth + 1)]
+        inside += [i for i in (album(a, depth + 1) for a in sorted(f.album_info, key=key)) if i["uuids"]]
+        if not inside:
+            return []
+        uuids = set().union(*(i["uuids"] for i in inside if i["depth"] == depth + 1))
+        return [{"id": f.uuid, "title": f.title or "Untitled folder", "folder": True,
+                 "depth": depth, "uuids": uuids}] + inside
+
+    items = [i for f in sorted(db.folder_info, key=key) for i in folder(f, 0)]
+    items += [i for i in (album(a, 0) for a in sorted(db.album_info, key=key) if not a.folder_names)
+              if i["uuids"]]
+    return items
+
+
+def parse_numbers(text: str, n: int) -> list[int] | None:
+    """'1, 3-5' -> [0, 2, 3, 4]; None if anything isn't a number from 1 to n."""
+    picked = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        if not lo.isdigit() or (hi and not hi.isdigit()):
+            return None
+        a, b = int(lo), int(hi or lo)
+        if not 1 <= a <= b <= n:
+            return None
+        picked += range(a - 1, b)
+    return picked
+
+
+def choose_albums(items: list[dict], total: int, names: list[str] | None) -> list[dict] | None:
+    """Ask which folders and albums to scan. Returns the chosen ones, or None for everything."""
+    if names:
+        wanted = {n.casefold() for n in names}
+        chosen = [i for i in items if i["title"].casefold() in wanted]
+        found = {i["title"].casefold() for i in chosen}
+        missing = [n for n in names if n.casefold() not in found]
+        if missing:
+            sys.exit(f"No album or folder with videos called: {', '.join(missing)}")
+        return chosen
+    question = "What would you like to scan?"
+    if GUI:
+        gui_send("choose", question=question, total=total,
+                 items=[{"id": i["id"], "label": i["title"], "folder": i["folder"],
+                         "depth": i["depth"], "count": len(i["uuids"])} for i in items])
+        ans = sys.stdin.readline().strip()
+        if ans == "cancel":
+            sys.exit("Cancelled. Nothing was scanned.")
+        try:
+            ids = set(json.loads(ans))
+        except (ValueError, TypeError):
+            return None
+        return [i for i in items if i["id"] in ids] or None
+    if not sys.stdin.isatty():
+        return None
+    print(f"\n{question} Your library has {plural(total, 'video')} in these folders and albums:")
+    width = len(str(len(items)))
+    for n, i in enumerate(items, 1):
+        kind = "folder, " if i["folder"] else ""
+        print(f"  {n:>{width}}. {'   ' * i['depth']}{i['title']} ({kind}{plural(len(i['uuids']), 'video')})")
+    while True:
+        try:
+            ans = input("Type the numbers to scan, separated by commas (e.g. 1, 4-6), "
+                        "or press Enter to scan everything: ")
+        except EOFError:
+            return None
+        picked = parse_numbers(ans, len(items))
+        if picked is None:
+            print(f"  Please type numbers from 1 to {len(items)}.")
+        elif not picked:
+            return None
+        else:
+            return [items[k] for k in dict.fromkeys(picked)]
+
+
+def load_from_photos(library: str | None, albums: list[str] | None = None) -> tuple[list[Video], str]:
+    """The videos to scan, and a description of where they came from for the report."""
     import osxphotos
     print("Reading your Photos library (read-only)…")
     db = osxphotos.PhotosDB(dbfile=library) if library else osxphotos.PhotosDB()
-    videos = []
+    candidates = []
     for p in db.photos(images=False, movies=True):
         # Shared-album and "Shared with You" items don't use your iCloud storage.
         if getattr(p, "shared", False):
@@ -292,6 +380,21 @@ def load_from_photos(library: str | None) -> list[Video]:
         name = (p.original_filename or p.filename or "").lower()
         if "smaller" in name:
             continue
+        candidates.append(p)
+
+    source = "Photos library"
+    items = photos_choices(db, {p.uuid for p in candidates})
+    chosen = choose_albums(items, len(candidates), albums) if items else None
+    if chosen:
+        keep = set().union(*(i["uuids"] for i in chosen))
+        candidates = [p for p in candidates if p.uuid in keep]
+        titles = [i["title"] for i in chosen]
+        source = "Photos: " + (", ".join(titles) if len(titles) <= 3 else
+                               f"{', '.join(titles[:3])} and {len(titles) - 3} more")
+        print(f"Scanning {plural(len(candidates), 'video')} in {', '.join(titles)}.")
+
+    videos = []
+    for p in candidates:
         exif = getattr(p, "exif_info", None)
         duration = float(getattr(exif, "duration", None) or 0)
         path = p.path if (p.path and os.path.exists(p.path)) else None
@@ -324,7 +427,7 @@ def load_from_photos(library: str | None) -> list[Video]:
                 "location": tuple(getattr(p, "location", None) or (None, None)),
             },
         ))
-    return videos
+    return videos, source
 
 
 def norm_codec(c: str | None) -> str:
@@ -1189,6 +1292,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--folder", help="scan a folder of video files instead of the Photos library")
     ap.add_argument("--library", help="path to a .photoslibrary (default: your system library)")
+    ap.add_argument("--album", action="append", metavar="NAME",
+                    help="only scan this album or folder in Photos (can be given more than once); "
+                         "without it you're asked which to scan")
     ap.add_argument("--out", default=str(Path.home() / "Desktop" / "Video Cleanup Report"))
     dl = ap.add_mutually_exclusive_group()
     dl.add_argument("--download-missing", action="store_true", default=None,
@@ -1215,7 +1321,7 @@ def main() -> None:
 
     if use_photos:
         try:
-            videos = load_from_photos(args.library)
+            videos, source = load_from_photos(args.library, args.album)
         except Exception as exc:
             msg = str(exc)
             print(f"\nCouldn't read the Photos library: {msg}")
@@ -1228,7 +1334,6 @@ def main() -> None:
                     print("Give Terminal 'Full Disk Access' in System Settings › Privacy & Security, "
                           "then quit and reopen Terminal and try again.")
             sys.exit(1)
-        source = "Photos library"
     # else:
     #     videos = load_from_folder(args.folder, ff)
     #     source = f"Folder {args.folder}"

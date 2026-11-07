@@ -28,6 +28,9 @@ The app is built for Apple Silicon Macs (M1 and later).
 uv run video_cleanup.py
 ```
 
+It first asks whether to scan your whole library or just some of your folders and
+albums. To skip the question, name them: `uv run video_cleanup.py --album "Holidays" --album "Kids"`.
+
 Your Terminal app needs Full Disk Access too.
 
 ## Testing changes
