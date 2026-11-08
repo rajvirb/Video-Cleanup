@@ -78,6 +78,7 @@ public struct SetMember: Hashable, Sendable {
 /// (largest first), then the ones to review.
 public struct DuplicateSet: Identifiable, Hashable, Sendable {
     public let members: [SetMember]
+    public init(members: [SetMember]) { self.members = members }
     public var id: Int { members[0].index }
     public var keeper: Int { members[0].index }
 
