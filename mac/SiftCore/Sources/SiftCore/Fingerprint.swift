@@ -29,6 +29,26 @@ public enum Fingerprint {
         return words
     }
 
+    /// A video frame's 64-bit difference hash (from a 9×8 greyscale version), or nil if the
+    /// frame is too dark or flat to say anything useful, such as a black opening frame.
+    public static func frameHash(gray: [UInt8], width: Int, height: Int) -> UInt64? {
+        guard width > 0, height > 0, gray.count >= width * height else { return nil }
+        let px = boxResize(gray: gray, width: width, height: height, toWidth: 9, toHeight: 8)
+            .map { $0.rounded(.towardZero) }               // whole grey levels, as the calibration used
+        let mean = px.reduce(0, +) / Double(px.count)
+        let variance = px.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(px.count)
+        if variance.squareRoot() < 3 || mean < 12 { return nil }
+        var hash: UInt64 = 0
+        var bit = 0
+        for row in 0..<8 {
+            for col in 0..<8 {
+                if px[row * 9 + col + 1] > px[row * 9 + col] { hash |= 1 << UInt64(63 - bit) }
+                bit += 1
+            }
+        }
+        return hash
+    }
+
     /// How many of the 256 bits differ.
     public static func distance(_ a: [UInt64], _ b: [UInt64]) -> Int {
         (a[0] ^ b[0]).nonzeroBitCount + (a[1] ^ b[1]).nonzeroBitCount

@@ -35,16 +35,34 @@ final class VideoCompressor: @unchecked Sendable {
         reader?.cancelReading()
     }
 
-    /// Makes the copy and saves it to Photos. Returns the new item's identifier and size.
-    /// `progress` goes from 0 to 1 (downloading from iCloud counts as the first tenth).
-    func compress(_ id: String, mode: CompressionMode, progress: @escaping @Sendable (Double) -> Void) async throws -> (String, Int64) {
+    /// What happened to one video's copy.
+    struct Made {
+        let photosID: String?       // the copy in Photos, if it was saved there
+        let size: Int64
+        let file: URL?              // the copy in the comparison folder, if it was saved there
+    }
+
+    /// The copy's name: the original's, with " - sift compression" before the extension.
+    static func copyName(_ original: String) -> String {
+        let url = URL(fileURLWithPath: original)
+        let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+        return "\(url.deletingPathExtension().lastPathComponent) - sift compression.\(ext)"
+    }
+
+    /// Makes the copy, and saves it to Photos and/or into `folder` next to a copy of the
+    /// original. `progress` goes from 0 to 1 (downloading from iCloud counts as the first tenth).
+    func compress(_ id: String, mode: CompressionMode, toPhotos: Bool, folder: URL?, library: PhotoLibrary,
+                  progress: @escaping @Sendable (Double) -> Void) async throws -> Made {
         guard let original = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject,
               let asset = await originalAsset(original, progress: { progress($0 * 0.1) }) else {
             throw CompressionError.notAvailable
         }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
-        defer { try? FileManager.default.removeItem(at: url) }
+        let originalName = PHAssetResource.assetResources(for: original).first { $0.type == .video }?.originalFilename ?? "Video.mov"
+        let name = Self.copyName(originalName)
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let url = workDir.appendingPathComponent(name)
+        defer { try? FileManager.default.removeItem(at: workDir) }
         let sourceSize = (try? (asset as? AVURLAsset)?.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }
         try await encode(asset, to: url, mode: mode) { progress(0.1 + $0 * 0.85) }
 
@@ -55,9 +73,17 @@ final class VideoCompressor: @unchecked Sendable {
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         if let sourceSize, Double(size) > 0.85 * Double(sourceSize) { throw CompressionError.notSmaller }
 
-        let newID = try await save(url, like: original)
+        // into the comparison folder: the copy, next to a copy of the original
+        var file: URL?
+        if let folder {
+            let destination = PhotoLibrary.unused(folder.appendingPathComponent(name))
+            try FileManager.default.copyItem(at: url, to: destination)
+            file = destination
+            _ = try await library.exportOriginal(id, to: folder)
+        }
+        let newID = toPhotos ? try await save(url, like: original, name: name) : nil
         progress(1)
-        return (newID, size)
+        return Made(photosID: newID, size: size, file: file)
     }
 
     // MARK: getting the original
@@ -97,11 +123,12 @@ final class VideoCompressor: @unchecked Sendable {
         let out = Compression.outputSize(width: width, height: height, shortSide: short)
         let kbps = Compression.targetKbps(shortSide: short, fps: fps)
 
+        let mp4 = ["mp4", "m4v"].contains(url.pathExtension.lowercased())
         let reader = try AVAssetReader(asset: asset)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let writer = try AVAssetWriter(outputURL: url, fileType: mp4 ? .mp4 : .mov)
         self.reader = reader
         self.writer = writer
-        writer.metadata = Self.quickTime(try await asset.load(.metadata))   // camera make and model, place, date
+        writer.metadata = metadata(try await asset.load(.metadata))   // camera make and model, place, date
 
         let pixelFormat = tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: pixelFormat])
@@ -127,7 +154,7 @@ final class VideoCompressor: @unchecked Sendable {
         }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         videoIn.transform = try await videoTrack.load(.preferredTransform)       // keeps portrait videos upright
-        videoIn.metadata = Self.quickTime(try await videoTrack.load(.metadata))  // the lens
+        videoIn.metadata = metadata(try await videoTrack.load(.metadata))  // the lens
         videoIn.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoIn) else { throw CompressionError.failed("The Mac's HEVC encoder couldn't take this video.") }
         writer.add(videoIn)
@@ -146,7 +173,14 @@ final class VideoCompressor: @unchecked Sendable {
             }
         }
 
-        guard writer.startWriting() else { throw CompressionError.failed(writer.error?.localizedDescription ?? "Couldn't start writing.") }
+        if !writer.startWriting() {
+            // an MP4 can't always hold an iPhone's QuickTime metadata: try once more without it
+            guard mp4, !writer.metadata.isEmpty else {
+                throw CompressionError.failed(writer.error?.localizedDescription ?? "Couldn't start writing.")
+            }
+            try? FileManager.default.removeItem(at: url)
+            return try await encodeWithoutMetadata(asset, to: url, mode: mode, progress: progress)
+        }
         guard reader.startReading() else { throw CompressionError.failed(reader.error?.localizedDescription ?? "Couldn't read the video.") }
         writer.startSession(atSourceTime: .zero)
 
@@ -170,9 +204,22 @@ final class VideoCompressor: @unchecked Sendable {
         }
     }
 
+    private var skipMetadata = false
+
+    private func encodeWithoutMetadata(_ asset: AVAsset, to url: URL, mode: CompressionMode,
+                                       progress: @escaping @Sendable (Double) -> Void) async throws {
+        skipMetadata = true
+        defer { skipMetadata = false }
+        try await encode(asset, to: url, mode: mode, progress: progress)
+    }
+
     /// The metadata a QuickTime file can hold (which is all of an iPhone video's).
     private static func quickTime(_ items: [AVMetadataItem]) -> [AVMetadataItem] {
         items.filter { $0.keySpace == .quickTimeMetadata || $0.keySpace == .quickTimeUserData }
+    }
+
+    private func metadata(_ items: [AVMetadataItem]) -> [AVMetadataItem] {
+        skipMetadata ? [] : Self.quickTime(items)
     }
 
     /// Feeds one track's samples from the reader to the writer until it runs out.
@@ -205,7 +252,7 @@ final class VideoCompressor: @unchecked Sendable {
 
     /// Adds the copy to Photos with the original's date, place and favourite status, in the
     /// same albums, and in Sift's albums for comparing (the original goes in those too).
-    private func save(_ url: URL, like original: PHAsset) async throws -> String {
+    private func save(_ url: URL, like original: PHAsset, name: String) async throws -> String {
         let copies = try await album(Self.albumCopies)
         let originals = try await album(Self.albumOriginals)
         let compare = try await album(Self.albumCompare)
@@ -214,7 +261,8 @@ final class VideoCompressor: @unchecked Sendable {
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
-            options.shouldMoveFile = true
+            options.shouldMoveFile = false             // the folder copy may still need it
+            options.originalFilename = name             // "IMG_1234 - sift compression.MOV"
             request.addResource(with: .video, fileURL: url, options: options)
             request.creationDate = original.creationDate
             request.location = original.location

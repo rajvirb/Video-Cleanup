@@ -1,5 +1,12 @@
+import AVKit
+import Photos
 import SiftCore
 import SwiftUI
+
+extension Notification.Name {
+    /// Starts every video in the compare view together, from the beginning.
+    static let playAllVideos = Notification.Name("SiftPlayAllVideos")
+}
 
 /// One set at a time, big and side by side, in full quality. All the photos zoom
 /// together and follow the pointer, so you can compare the same detail in each.
@@ -18,17 +25,26 @@ struct CompareView: View {
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Set \(k + 1) of \(model.sets.count)").font(Theme.display(17, bold: false))
-                        Text("← → switch set · 1–9 keep or delete · Z zoom").font(.caption).foregroundStyle(Theme.muted)
+                        Text(model.job == .photos ? "← → switch set · 1–9 keep or delete · Z zoom" : "← → switch set · 1–9 keep or delete")
+                            .font(.caption).foregroundStyle(Theme.muted)
                     }
                     Spacer()
-                    Picker("Zoom", selection: $zoom) {
-                        Text("Fit").tag(CGFloat(1))
-                        Text("2×").tag(CGFloat(2))
-                        Text("4×").tag(CGFloat(4))
+                    if model.job == .photos {
+                        Picker("Zoom", selection: $zoom) {
+                            Text("Fit").tag(CGFloat(1))
+                            Text("2×").tag(CGFloat(2))
+                            Text("4×").tag(CGFloat(4))
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 150)
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 150)
+                    if model.job != .photos {
+                        Button("Play All", systemImage: "play.fill") {
+                            NotificationCenter.default.post(name: .playAllVideos, object: nil)
+                        }
+                        .buttonStyle(.secondary)
+                    }
                     Button("Keep All") { model.keepAll(set) }.buttonStyle(.secondary)
                     Button { model.comparing = k - 1 } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(.secondary)
@@ -129,6 +145,18 @@ struct ComparePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if item.duration > 0 {
+                VideoPanel(id: item.id)
+                    .overlay(alignment: .topLeading) {
+                        HStack(alignment: .top) {
+                            KeepDeleteTag(marked: marked)
+                            Spacer()
+                            Badges(item: item, member: member)
+                        }
+                        .padding(9)
+                        .allowsHitTesting(false)
+                    }
+            } else {
             GeometryReader { geo in
                 ZStack {
                     Color.black
@@ -169,6 +197,7 @@ struct ComparePanel: View {
                 }
                 .overlay(alignment: .bottomTrailing) { status.padding(9) }
             }
+            }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(item.name).fontWeight(.semibold).lineLimit(1)
@@ -182,6 +211,7 @@ struct ComparePanel: View {
                 }
                 HStack(spacing: 8) {
                     if let date = item.date { Text(date.formatted(date: .abbreviated, time: .shortened)) }
+                    if item.duration > 0 { Text(duration(item.duration)).monospacedDigit() }
                     Text("\(item.width)×\(item.height)")
                         .fontWeight(bestPixels ? .semibold : .regular)
                         .foregroundStyle(bestPixels ? Theme.ink : Theme.muted)
@@ -204,6 +234,7 @@ struct ComparePanel: View {
         .overlay(RoundedRectangle(cornerRadius: Theme.radiusLarge)
             .strokeBorder(marked ? Theme.danger : Theme.border, lineWidth: marked ? 2 : 1))
         .task(id: item.id) {
+            guard item.duration == 0 else { return }       // videos load in their player
             loading = true
             full = nil
             let (image, ok) = await model.library.fullImage(item.id) { downloaded = $0 }
@@ -221,6 +252,52 @@ struct ComparePanel: View {
             StatusLabel(text: "Preview only: the full-quality version couldn't be loaded",
                         symbol: "exclamationmark.triangle", background: Color(red: 0.62, green: 0.4, blue: 0.08).opacity(0.92))
         }
+    }
+}
+
+/// A video in the compare view, played from Photos (downloading from iCloud if need be).
+struct VideoPanel: View {
+    let id: String
+    @State private var player: AVPlayer?
+    @State private var failed = false
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let player {
+                VideoPlayer(player: player)
+            } else if failed {
+                Text("This video couldn't be loaded.").foregroundStyle(.white.opacity(0.7))
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .task(id: id) {
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+                failed = true
+                return
+            }
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .automatic
+            let item: AVPlayerItem? = await withCheckedContinuation { continuation in
+                PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { item, _ in
+                    continuation.resume(returning: item)
+                }
+            }
+            if let item {
+                let made = AVPlayer(playerItem: item)
+                made.isMuted = true
+                player = made
+            } else {
+                failed = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .playAllVideos)) { _ in
+            player?.seek(to: .zero)
+            player?.play()
+        }
+        .onDisappear { player?.pause() }
     }
 }
 

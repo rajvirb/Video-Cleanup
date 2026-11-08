@@ -16,8 +16,9 @@ struct ResultsView: View {
                     Image(systemName: "checkmark.circle")
                         .font(.system(size: 40, weight: .light))
                         .foregroundStyle(Theme.success)
-                    Text(model.items.isEmpty ? "No photos to check" : "Nothing left to review").font(Theme.display(24))
-                    Text("Sift didn't find any more duplicates or similar shots.").foregroundStyle(Theme.muted)
+                    Text(model.items.isEmpty ? "No \(model.noun)s to check" : "Nothing left to review").font(Theme.display(24))
+                    Text("Sift didn't find any more duplicates\(model.job == .photos ? " or similar shots" : "").")
+                        .foregroundStyle(Theme.muted)
                     Button("Scan Again") { model.stage = .start }
                         .buttonStyle(.secondary)
                         .padding(.top, 4)
@@ -44,7 +45,7 @@ struct ResultsView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Eyebrow(text: "Duplicate photos")
+                    Eyebrow(text: "Duplicate \(model.noun)s")
                     Text(model.deleteSuggested > 0 ? "\(Format.size(model.savingSuggested)) could be freed"
                          : "\(Format.plural(model.sets.count, "set")) to look at")
                         .font(Theme.display(30))
@@ -112,7 +113,7 @@ struct SetRow: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text("Set \(number)").font(Theme.display(15, bold: false))
-                Text(Format.plural(set.members.count, "photo")).foregroundStyle(Theme.muted)
+                Text(Format.plural(set.members.count, model.noun)).foregroundStyle(Theme.muted)
                 let saving = set.saving(model.items)
                 if saving > 0 { Pill(text: "Frees \(Format.size(saving))", color: Theme.accentText, background: Theme.accentSoft) }
                 Spacer()
@@ -146,6 +147,16 @@ struct ItemTile: View {
                     .clipped()
                     .saturation(marked ? 0.2 : 1)
                     .opacity(marked ? 0.55 : 1)
+                    .overlay(alignment: .bottomTrailing) {
+                        if item.duration > 0 {
+                            Text(duration(item.duration))
+                                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(RoundedRectangle(cornerRadius: 4).fill(.black.opacity(0.6)))
+                                .foregroundStyle(.white)
+                                .padding(6)
+                        }
+                    }
                 HStack(alignment: .top) {
                     KeepDeleteTag(marked: marked)
                     Spacer()
@@ -206,6 +217,7 @@ struct Badges: View {
             if item.burst { onPhoto("Burst", .black.opacity(0.55)) }
             if item.raw { onPhoto("RAW", .black.opacity(0.55)) }
             if item.edited { onPhoto("Edited", .black.opacity(0.55)) }
+            if item.cloudOnly && item.duration > 0 { onPhoto("iCloud", .black.opacity(0.55)) }
         }
     }
 

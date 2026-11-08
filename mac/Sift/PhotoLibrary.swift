@@ -2,6 +2,7 @@ import AppKit
 import Photos
 import SiftCore
 import UniformTypeIdentifiers
+import AVFoundation
 
 /// An album or folder in the Photos library, with the photos in it (a folder holds
 /// everything in its albums and subfolders).
@@ -34,12 +35,18 @@ final class PhotoLibrary: @unchecked Sendable {
 
     // MARK: reading the library
 
-    private var imagesOnly: PHFetchOptions {
+    private var imagesOnly: PHFetchOptions { only(.image) }
+
+    private func only(_ type: PHAssetMediaType) -> PHFetchOptions {
         let options = PHFetchOptions()
-        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+        options.predicate = NSPredicate(format: "mediaType == %d", type.rawValue)
         options.includeAssetSourceTypes = [.typeUserLibrary]     // not shared albums: they don't use your storage
         options.includeAllBurstAssets = true                     // burst leftovers are worth finding
         return options
+    }
+
+    func count(_ type: PHAssetMediaType) -> Int {
+        PHAsset.fetchAssets(with: only(type)).count
     }
 
     /// Every photo in the library, as Photos assets.
@@ -95,15 +102,15 @@ final class PhotoLibrary: @unchecked Sendable {
 
     /// The library's albums and folders that have photos in them, as Photos' sidebar
     /// shows them (folders first, then albums, alphabetically).
-    func albums() -> [AlbumNode] {
-        nodes(in: PHCollectionList.fetchTopLevelUserCollections(with: nil))
+    func albums(_ type: PHAssetMediaType = .image) -> [AlbumNode] {
+        nodes(in: PHCollectionList.fetchTopLevelUserCollections(with: nil), type: type)
     }
 
-    private func nodes(in collections: PHFetchResult<PHCollection>) -> [AlbumNode] {
+    private func nodes(in collections: PHFetchResult<PHCollection>, type: PHAssetMediaType) -> [AlbumNode] {
         var folders: [AlbumNode] = [], albums: [AlbumNode] = []
         collections.enumerateObjects { collection, _, _ in
             if let list = collection as? PHCollectionList {
-                let children = self.nodes(in: PHCollection.fetchCollections(in: list, options: nil))
+                let children = self.nodes(in: PHCollection.fetchCollections(in: list, options: nil), type: type)
                 let ids = children.reduce(into: Set<String>()) { $0.formUnion($1.photoIDs) }
                 if !ids.isEmpty {
                     folders.append(AlbumNode(id: list.localIdentifier, title: list.localizedTitle ?? "Folder",
@@ -111,7 +118,7 @@ final class PhotoLibrary: @unchecked Sendable {
                 }
             } else if let album = collection as? PHAssetCollection {
                 var ids = Set<String>()
-                PHAsset.fetchAssets(in: album, options: self.imagesOnly).enumerateObjects { a, _, _ in
+                PHAsset.fetchAssets(in: album, options: self.only(type)).enumerateObjects { a, _, _ in
                     ids.insert(a.localIdentifier)
                 }
                 if !ids.isEmpty {
@@ -177,7 +184,12 @@ final class PhotoLibrary: @unchecked Sendable {
             if result != nil { break }
         }
         guard let cg = result else { return nil }
-        let scale = min(1, 160 / Double(max(cg.width, cg.height)))
+        return Self.gray(cg, maxSide: 160)
+    }
+
+    /// A small greyscale copy of an image, no more than maxSide pixels across.
+    static func gray(_ cg: CGImage, maxSide: Double) -> (pixels: [UInt8], width: Int, height: Int)? {
+        let scale = min(1, maxSide / Double(max(cg.width, cg.height)))
         let w = max(1, Int(Double(cg.width) * scale)), h = max(1, Int(Double(cg.height) * scale))
         var pixels = [UInt8](repeating: 0, count: w * h)
         let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
@@ -189,6 +201,117 @@ final class PhotoLibrary: @unchecked Sendable {
             return true
         }
         return drawn ? (pixels, w, h) : nil
+    }
+
+    /// Fingerprints of frames throughout each video (from its file on this Mac), and of
+    /// Photos' preview image of it (which exists even for videos stored only in iCloud).
+    /// Remembered between scans. Calls `progress` as each video is done.
+    func videoFingerprints(_ ids: [String], progress: @escaping (Int, Int) -> Void) async -> [String: (frames: [UInt64], poster: UInt64?)] {
+        var cache = loadVideoCache()
+        var byID: [String: PHAsset] = [:]
+        PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil).enumerateObjects { a, _, _ in byID[a.localIdentifier] = a }
+        func key(_ a: PHAsset) -> String { "\(a.localIdentifier)|\(Int(a.modificationDate?.timeIntervalSince1970 ?? 0))" }
+
+        var results: [String: (frames: [UInt64], poster: UInt64?)] = [:]
+        var todo: [PHAsset] = []
+        for id in ids {
+            guard let asset = byID[id] else { continue }
+            if let cached = cache[key(asset)] { results[id] = (cached.frames, cached.poster) } else { todo.append(asset) }
+        }
+        var done = 0
+        await withTaskGroup(of: (PHAsset, [UInt64], UInt64?).self) { group in
+            var next = 0
+            func start() {
+                guard next < todo.count else { return }
+                let asset = todo[next]
+                next += 1
+                group.addTask {
+                    let poster = self.grayThumbnail(asset).flatMap { Fingerprint.frameHash(gray: $0.pixels, width: $0.width, height: $0.height) }
+                    return (asset, await self.frameHashes(asset), poster)
+                }
+            }
+            for _ in 0..<4 { start() }                     // four videos at a time
+            for await (asset, frames, poster) in group {
+                results[asset.localIdentifier] = (frames, poster)
+                cache[key(asset)] = VideoPrint(frames: frames, poster: poster)
+                done += 1
+                progress(done, todo.count)
+                if done % 25 == 0 { saveVideoCache(cache) }
+                start()
+            }
+        }
+        saveVideoCache(cache)
+        return results
+    }
+
+    /// Fingerprints of frames taken through a video, if its file is on this Mac.
+    private func frameHashes(_ asset: PHAsset) async -> [UInt64] {
+        let options = PHVideoRequestOptions()
+        options.version = .original
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = false               // only videos already on this Mac
+        let video: AVAsset? = await withCheckedContinuation { continuation in
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { found, _, _ in
+                continuation.resume(returning: found)
+            }
+        }
+        guard let video else { return [] }
+        let generator = AVAssetImageGenerator(asset: video)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 96, height: 96)
+        let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        let times = VideoMatcher.frameTimes(duration: asset.duration).map { CMTime(seconds: $0, preferredTimescale: 600) }
+        var hashes: [UInt64] = []
+        for await result in generator.images(for: times) {
+            guard let image = try? result.image, let gray = Self.gray(image, maxSide: 96),
+                  let hash = Fingerprint.frameHash(gray: gray.pixels, width: gray.width, height: gray.height) else { continue }
+            hashes.append(hash)
+        }
+        return hashes
+    }
+
+    /// Saves a copy of an item's original file into a folder (downloading it from iCloud if
+    /// need be), under its original name. Returns where it went.
+    func exportOriginal(_ id: String, to folder: URL) async throws -> URL {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let original = resources.first(where: { $0.type == .video || $0.type == .photo }) ?? resources.first else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let url = Self.unused(folder.appendingPathComponent(original.originalFilename))
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        try await PHAssetResourceManager.default().writeData(for: original, toFile: url, options: options)
+        return url
+    }
+
+    /// The URL, or one with " 2", " 3"… before the extension if there's already a file there.
+    static func unused(_ url: URL) -> URL {
+        var candidate = url
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let base = url.deletingPathExtension().lastPathComponent
+            candidate = url.deletingLastPathComponent().appendingPathComponent("\(base) \(n)").appendingPathExtension(url.pathExtension)
+            n += 1
+        }
+        return candidate
+    }
+
+    private struct VideoPrint: Codable { let frames: [UInt64]; let poster: UInt64? }
+
+    private var videoCacheURL: URL { cacheURL.deletingLastPathComponent().appendingPathComponent("video-fingerprints.json") }
+
+    private func loadVideoCache() -> [String: VideoPrint] {
+        guard let data = try? Data(contentsOf: videoCacheURL) else { return [:] }
+        return (try? JSONDecoder().decode([String: VideoPrint].self, from: data)) ?? [:]
+    }
+
+    private func saveVideoCache(_ cache: [String: VideoPrint]) {
+        if let data = try? JSONEncoder().encode(cache) { try? data.write(to: videoCacheURL, options: .atomic) }
     }
 
     private func loadCache() -> [String: [UInt64]] {
@@ -247,12 +370,11 @@ final class PhotoLibrary: @unchecked Sendable {
 
     /// Every video in the library, with what's needed to decide whether a smaller copy is
     /// worth making. (The frame rate is only known once a file is opened, so it's left out.)
-    func videos(progress: @escaping (Int, Int) -> Void) -> [VideoItem] {
-        let options = PHFetchOptions()
-        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
-        options.includeAssetSourceTypes = [.typeUserLibrary]
+    func videos(only ids: Set<String>? = nil, progress: @escaping (Int, Int) -> Void) -> [VideoItem] {
         var list: [PHAsset] = []
-        PHAsset.fetchAssets(with: options).enumerateObjects { asset, _, _ in list.append(asset) }
+        PHAsset.fetchAssets(with: only(.video)).enumerateObjects { asset, _, _ in
+            if ids == nil || ids!.contains(asset.localIdentifier) { list.append(asset) }
+        }
         var items = [VideoItem?](repeating: nil, count: list.count)
         let lock = NSLock()
         var done = 0

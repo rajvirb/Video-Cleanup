@@ -7,7 +7,12 @@ import SwiftUI
 @MainActor
 final class AppModel: ObservableObject {
     enum Stage { case welcome, noAccess, start, scanning, results, videos, compressing, compressed }
-    enum Job: Hashable { case photos, videos }
+    enum Job: Hashable { case photos, videoDuplicates, videoCompression }
+    enum VideoSort: String, CaseIterable, Identifiable {
+        case saving = "Most space saved first", size = "Largest first", length = "Longest first"
+        case newest = "Newest first", oldest = "Oldest first", name = "Name"
+        var id: String { rawValue }
+    }
     enum Scope: Hashable { case everything, albums }
     enum SortOrder: String, CaseIterable, Identifiable {
         case space = "Most space saved first", count = "Largest sets first"
@@ -21,8 +26,11 @@ final class AppModel: ObservableObject {
     @Published var job: Job = .photos
     // what to scan
     @Published var totalPhotos = 0
-    @Published var albums: [AlbumNode] = []
-    @Published var loadingAlbums = false
+    @Published var totalVideos = 0
+    @Published private var photoAlbums: [AlbumNode] = []
+    @Published private var videoAlbums: [AlbumNode] = []
+    @Published private var loadingPhotoAlbums = false
+    @Published private var loadingVideoAlbums = false
     @Published var scope: Scope = .everything
     @Published var chosenAlbums: Set<String> = []
     @Published var strictness: Strictness = .balanced
@@ -54,8 +62,19 @@ final class AppModel: ObservableObject {
     @Published var compressDetail = ""
     @Published var compressResults: [CompressResult] = []
     @Published var originalsDeleted = false
+    @Published var videoSort: VideoSort = .saving
+    // where the smaller copies go: into Photos, and/or a folder next to copies of the originals
+    @Published var importToPhotos = true
+    @Published var saveToFolder = false
+    @Published var comparisonFolder: URL?
+    @Published var lastFolderUsed: URL?
+    private static let folderKey = "comparisonFolderBookmark"
     private var compressor: VideoCompressor?
     private var compressStarted = Date()
+
+    init() {
+        restoreComparisonFolder()
+    }
 
     // MARK: getting started
 
@@ -66,16 +85,26 @@ final class AppModel: ObservableObject {
             stage = .noAccess
             return
         }
-        totalPhotos = library.allPhotos().count
+        totalPhotos = library.count(.image)
+        totalVideos = library.count(.video)
         stage = .start
-        loadingAlbums = true
+        loadingPhotoAlbums = true
+        loadingVideoAlbums = true
         let library = self.library
-        let found = await Task.detached(priority: .userInitiated) { library.albums() }.value
-        albums = found
-        loadingAlbums = false
+        photoAlbums = await Task.detached(priority: .userInitiated) { library.albums(.image) }.value
+        loadingPhotoAlbums = false
+        videoAlbums = await Task.detached(priority: .userInitiated) { library.albums(.video) }.value
+        loadingVideoAlbums = false
     }
 
-    var chosenPhotoIDs: Set<String> {
+    /// The albums and folders for the chosen job (photos, or videos). Ticks are shared, so
+    /// ticking "Holidays" means its photos when finding photos, and its videos otherwise.
+    var albums: [AlbumNode] { job == .photos ? photoAlbums : videoAlbums }
+    var loadingAlbums: Bool { job == .photos ? loadingPhotoAlbums : loadingVideoAlbums }
+    var total: Int { job == .photos ? totalPhotos : totalVideos }
+    var noun: String { job == .photos ? "photo" : "video" }
+
+    var chosenIDs: Set<String> {
         var ids = Set<String>()
         func walk(_ nodes: [AlbumNode]) {
             for node in nodes {
@@ -86,7 +115,7 @@ final class AppModel: ObservableObject {
         return ids
     }
 
-    var canScan: Bool { scope == .everything || !chosenPhotoIDs.isEmpty }
+    var canScan: Bool { scope == .everything || !chosenIDs.isEmpty }
 
     // MARK: scanning
 
@@ -94,7 +123,7 @@ final class AppModel: ObservableObject {
         stage = .scanning
         message = nil
         let library = self.library
-        let only = scope == .albums ? chosenPhotoIDs : nil
+        let only = scope == .albums ? chosenIDs : nil
         let strictness = self.strictness
         scanTask = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.step("Reading your library…")
@@ -123,7 +152,50 @@ final class AppModel: ObservableObject {
     }
 
     func startJob() {
-        if job == .photos { scan() } else { findVideos() }
+        switch job {
+        case .photos: scan()
+        case .videoDuplicates: scanVideos()
+        case .videoCompression: findVideos()
+        }
+    }
+
+    /// Finds duplicate and trimmed videos: fingerprints frames through each one (and
+    /// Photos' preview of it), then looks for them in the others.
+    func scanVideos() {
+        stage = .scanning
+        message = nil
+        let library = self.library
+        let only = scope == .albums ? chosenIDs : nil
+        let strictness = self.strictness
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Reading your videos…")
+            let videos = library.videos(only: only) { done, total in
+                Task { @MainActor in self?.progress(done, total, "Reading") }
+            }
+            if Task.isCancelled { return }
+            await self?.step("Fingerprinting \(Format.plural(videos.count, "video"))…")
+            let prints = await library.videoFingerprints(videos.map(\.id)) { done, total in
+                Task { @MainActor in self?.progress(done, total, "Fingerprinting") }
+            }
+            if Task.isCancelled { return }
+            await self?.step("Looking for duplicate videos…")
+            let clips = videos.map { v in
+                VideoClip(id: v.id, size: v.size, duration: v.duration, width: v.width, height: v.height,
+                          favorite: v.favorite, cloudOnly: prints[v.id]?.frames.isEmpty ?? true,
+                          frames: prints[v.id]?.frames ?? [], poster: prints[v.id]?.poster)
+            }
+            let matches = VideoMatcher.findMatches(clips, strictness: strictness) { done, total in
+                Task { @MainActor in self?.progress(done, total, "Comparing") }
+            }
+            let sets = VideoMatcher.buildSets(clips, matches: matches)
+            let items = videos.map { v in
+                PhotoItem(id: v.id, name: v.name, date: v.date, width: v.width, height: v.height, size: v.size,
+                          favorite: v.favorite, edited: v.edited, cloudOnly: prints[v.id]?.frames.isEmpty ?? true,
+                          duration: v.duration)
+            }
+            if Task.isCancelled { return }
+            await self?.finish(items: items, sets: sets)
+        }
     }
 
     private func step(_ title: String) {
@@ -193,7 +265,7 @@ final class AppModel: ObservableObject {
         guard !ids.isEmpty else { return }
         let entries = items.filter { ids.contains($0.id) }.map {
             DeleteEntry(id: $0.id, name: $0.name, size: $0.size, favorite: $0.favorite, edited: $0.edited,
-                        live: $0.live, raw: $0.raw, isVideo: false)
+                        live: $0.live, raw: $0.raw, isVideo: job != .photos)
         }
         pendingDelete = PendingDelete(kind: .photos, entries: entries, nothingKept: setsWithNothingKept(ids))
     }
@@ -219,7 +291,7 @@ final class AppModel: ObservableObject {
             return left.count > 1 ? DuplicateSet(members: left) : nil   // sets of one are done
         }
         if let open = comparing, open >= sets.count { comparing = sets.isEmpty ? nil : sets.count - 1 }
-        message = "Deleted \(Format.plural(ids.count, "photo")) (\(Format.size(size))). They're in Recently Deleted "
+        message = "Deleted \(Format.plural(ids.count, noun)) (\(Format.size(size))). They're in Recently Deleted "
             + "in Photos for 30 days. To free the space now, empty Recently Deleted."
     }
 
@@ -231,9 +303,10 @@ final class AppModel: ObservableObject {
         message = nil
         originalsDeleted = false
         let library = self.library
+        let only = scope == .albums ? chosenIDs : nil
         scanTask = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.step("Reading your videos…")
-            let videos = library.videos { done, total in
+            let videos = library.videos(only: only) { done, total in
                 Task { @MainActor in self?.progress(done, total, "Reading") }
             }
             let candidates = videos.compactMap { video -> VideoCandidate? in
@@ -253,6 +326,51 @@ final class AppModel: ObservableObject {
         stage = .videos
     }
 
+    /// The videos to shrink, in the chosen order.
+    var sortedCandidates: [VideoCandidate] {
+        let mode = compressionMode
+        func saving(_ c: VideoCandidate) -> Int64 { c.plan(mode)?.saving(c.video) ?? -1 }
+        switch videoSort {
+        case .saving: return candidates.sorted { saving($0) > saving($1) }
+        case .size: return candidates.sorted { $0.video.size > $1.video.size }
+        case .length: return candidates.sorted { $0.video.duration > $1.video.duration }
+        case .newest: return candidates.sorted { ($0.video.date ?? .distantPast) > ($1.video.date ?? .distantPast) }
+        case .oldest: return candidates.sorted { ($0.video.date ?? .distantFuture) < ($1.video.date ?? .distantFuture) }
+        case .name: return candidates.sorted { $0.video.name.localizedStandardCompare($1.video.name) == .orderedAscending }
+        }
+    }
+
+    var canCompress: Bool {
+        !videosToCompress.isEmpty && (importToPhotos || (saveToFolder && comparisonFolder != nil))
+    }
+
+    /// Asks where to save the smaller copies (next to copies of the originals), and remembers it.
+    func chooseComparisonFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder for the smaller copies. Each goes next to a copy of its original, for comparing."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        comparisonFolder = url
+        saveToFolder = true
+        if let bookmark = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+            UserDefaults.standard.set(bookmark, forKey: Self.folderKey)
+        }
+    }
+
+    private func restoreComparisonFolder() {
+        guard let data = UserDefaults.standard.data(forKey: Self.folderKey) else { return }
+        var stale = false
+        comparisonFolder = try? URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil,
+                                    bookmarkDataIsStale: &stale)
+    }
+
+    func openComparisonFolder() {
+        if let folder = lastFolderUsed ?? comparisonFolder { NSWorkspace.shared.open(folder) }
+    }
+
     /// The videos that will be made smaller at the chosen setting.
     var videosToCompress: [VideoCandidate] {
         candidates.filter { chosenVideos.contains($0.id) && $0.plan(compressionMode) != nil }
@@ -263,8 +381,12 @@ final class AppModel: ObservableObject {
     }
 
     func compressVideos() {
-        let todo = videosToCompress
-        guard !todo.isEmpty else { return }
+        let todo = sortedCandidates.filter { chosenVideos.contains($0.id) && $0.plan(compressionMode) != nil }
+        guard !todo.isEmpty, canCompress else { return }
+        let toPhotos = importToPhotos
+        let folder = saveToFolder ? comparisonFolder : nil
+        let library = self.library
+        lastFolderUsed = folder
         stage = .compressing
         compressResults = []
         compressTotal = todo.count
@@ -273,21 +395,26 @@ final class AppModel: ObservableObject {
         let compressor = VideoCompressor()
         self.compressor = compressor
         scanTask = Task { [weak self] in
+            // the folder was chosen in an earlier session: the sandbox needs asking to use it again
+            let opened = folder?.startAccessingSecurityScopedResource() ?? false
+            defer { if opened { folder?.stopAccessingSecurityScopedResource() } }
             for (k, candidate) in todo.enumerated() {
                 guard let self, !Task.isCancelled else { break }
                 self.compressIndex = k + 1
                 self.compressName = candidate.video.name
                 self.compressFraction = 0
                 do {
-                    let (newID, size) = try await compressor.compress(candidate.id, mode: mode) { value in
+                    let made = try await compressor.compress(candidate.id, mode: mode, toPhotos: toPhotos, folder: folder,
+                                                             library: library) { value in
                         Task { @MainActor [weak self] in self?.updateCompressProgress(k, of: todo.count, value) }
                     }
-                    self.compressResults.append(CompressResult(video: candidate.video, newID: newID, newSize: size, problem: nil))
+                    self.compressResults.append(CompressResult(video: candidate.video, newID: made.photosID,
+                                                               newSize: made.size, file: made.file, problem: nil))
                 } catch is CancellationError {
                     break
                 } catch {
                     self.compressResults.append(CompressResult(video: candidate.video, newID: nil, newSize: nil,
-                                                               problem: error.localizedDescription))
+                                                               file: nil, problem: error.localizedDescription))
                 }
             }
             self?.stage = .compressed
@@ -309,12 +436,14 @@ final class AppModel: ObservableObject {
         scanTask?.cancel()
     }
 
-    var compressedOK: [CompressResult] { compressResults.filter { $0.newID != nil } }
+    var compressedOK: [CompressResult] { compressResults.filter { $0.newSize != nil } }
+    /// The ones whose copy is in Photos: only their originals can be deleted from here.
+    var compressedInPhotos: [CompressResult] { compressResults.filter { $0.newID != nil } }
     var compressedSaving: Int64 { compressedOK.reduce(0) { $0 + max(0, $1.video.size - ($1.newSize ?? 0)) } }
 
     /// Shows the summary before deleting the originals of the videos that now have a smaller copy.
     func requestDeleteOriginals() {
-        let entries = compressedOK.map {
+        let entries = compressedInPhotos.map {
             DeleteEntry(id: $0.video.id, name: $0.video.name, size: $0.video.size, favorite: $0.video.favorite,
                         edited: false, live: false, raw: false, isVideo: true)
         }
@@ -365,8 +494,9 @@ struct VideoCandidate: Identifiable, Hashable {
 
 struct CompressResult: Identifiable, Hashable {
     let video: VideoItem
-    let newID: String?
+    let newID: String?           // the copy in Photos
     let newSize: Int64?
+    let file: URL?               // the copy in the comparison folder
     let problem: String?
     var id: String { video.id }
 }

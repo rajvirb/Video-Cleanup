@@ -12,20 +12,22 @@ struct StartView: View {
                 HStack(spacing: 14) {
                     JobCard(job: .photos, symbol: "square.on.square", title: "Find duplicate photos",
                             detail: "Copies and similar shots, to compare side by side and delete.")
-                    JobCard(job: .videos, symbol: "film.stack", title: "Make videos smaller",
+                    JobCard(job: .videoDuplicates, symbol: "film.stack", title: "Find duplicate videos",
+                            detail: "Copies, re-saved versions and trimmed clips of the same video.")
+                    JobCard(job: .videoCompression, symbol: "arrow.down.right.and.arrow.up.left", title: "Make videos smaller",
                             detail: "Smaller HEVC copies of bulky videos, with their dates, places and cameras.")
                 }
-                if model.job == .photos { photoOptions } else { videoOptions }
+                scopeOptions
+                if model.job == .videoCompression { videoOptions } else { strictnessOptions }
                 HStack(alignment: .center) {
-                    Text(model.job == .photos ? "Finding duplicate videos is coming in a later version."
-                         : "Your originals are never changed.")
+                    Text("Nothing is deleted unless you choose to, and Sift asks you twice first.")
                         .font(.callout)
                         .foregroundStyle(Theme.muted)
                     Spacer()
-                    Button(model.job == .photos ? "Scan Photos" : "Find Videos to Shrink") { model.startJob() }
+                    Button(buttonTitle) { model.startJob() }
                         .buttonStyle(.primary)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(model.job == .photos && !model.canScan)
+                        .disabled(!model.canScan)
                 }
             }
             .padding(36)
@@ -48,39 +50,53 @@ struct StartView: View {
         }
     }
 
-    private var photoOptions: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("What to scan").font(Theme.display(17, bold: false))
-                Picker("What to scan", selection: $model.scope) {
-                    Text("Everything in my library (\(Format.plural(model.totalPhotos, "photo")))")
-                        .tag(AppModel.Scope.everything)
-                    Text("Only the albums and folders I tick").tag(AppModel.Scope.albums)
-                }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
-                if model.scope == .albums {
-                    AlbumPicker().frame(minHeight: 160, maxHeight: 260)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .card()
+    private var buttonTitle: String {
+        switch model.job {
+        case .photos: "Scan Photos"
+        case .videoDuplicates: "Scan Videos"
+        case .videoCompression: "Find Videos to Shrink"
+        }
+    }
 
-            VStack(alignment: .leading, spacing: 12) {
-                Text("How strict").font(Theme.display(17, bold: false))
-                Picker("How strict", selection: $model.strictness) {
-                    ForEach(Strictness.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 360)
-                Text(model.strictness.photoSummary)
+    private var scopeOptions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("What to scan").font(Theme.display(17, bold: false))
+            Picker("What to scan", selection: $model.scope) {
+                Text("Everything in my library (\(Format.plural(model.total, model.noun)))")
+                    .tag(AppModel.Scope.everything)
+                Text("Only the albums and folders I tick").tag(AppModel.Scope.albums)
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            if model.scope == .albums {
+                AlbumPicker().frame(minHeight: 160, maxHeight: 260)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
+    }
+
+    private var strictnessOptions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("How strict").font(Theme.display(17, bold: false))
+            Picker("How strict", selection: $model.strictness) {
+                ForEach(Strictness.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 360)
+            Text(model.job == .photos ? model.strictness.photoSummary : model.strictness.videoSummary)
+                .foregroundStyle(Theme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.job == .videoDuplicates {
+                Text("Videos stored only in iCloud are compared by their preview and length, which finds copies but not trimmed clips.")
+                    .font(.callout)
                     .foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .card()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
     }
 
     private var videoOptions: some View {
@@ -149,7 +165,7 @@ struct AlbumPicker: View {
             }
             .padding(.vertical, 8)
         } else if model.albums.isEmpty {
-            Text("Your library has no albums with photos in them.").foregroundStyle(Theme.muted)
+            Text("Your library has no albums with \(model.noun)s in them.").foregroundStyle(Theme.muted)
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 List {
@@ -167,8 +183,8 @@ struct AlbumPicker: View {
                 .listStyle(.bordered(alternatesRowBackgrounds: false))
                 .scrollContentBackground(.hidden)
                 .background(RoundedRectangle(cornerRadius: Theme.radius).fill(Theme.bg2))
-                Text(model.chosenPhotoIDs.isEmpty ? "Tick at least one album or folder."
-                     : "\(Format.plural(model.chosenPhotoIDs.count, "photo")) chosen")
+                Text(model.chosenIDs.isEmpty ? "Tick at least one album or folder."
+                     : "\(Format.plural(model.chosenIDs.count, model.noun)) chosen")
                     .font(.callout)
                     .foregroundStyle(Theme.muted)
             }
@@ -190,7 +206,7 @@ struct ScanningView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Eyebrow(text: model.job == .photos ? "Scanning photos" : "Finding videos")
+            Eyebrow(text: model.job == .photos ? "Scanning photos" : model.job == .videoDuplicates ? "Scanning videos" : "Finding videos")
             Text(model.stepTitle).font(Theme.display(26))
             if model.stepTotal > 0 {
                 ProgressView(value: Double(model.stepDone), total: Double(model.stepTotal))

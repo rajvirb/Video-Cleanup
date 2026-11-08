@@ -192,3 +192,102 @@ final class CompressionTests: XCTestCase {
         XCTAssertEqual(odd.width % 2, 0); XCTAssertEqual(odd.height % 2, 0)
     }
 }
+
+final class VideoMatchingTests: XCTestCase {
+    var rng = SeededGenerator(seed: 42)
+
+    func noise(_ h: UInt64, _ bits: Int) -> UInt64 {
+        var h = h
+        var flipped = Set<Int>()
+        while flipped.count < bits { flipped.insert(Int.random(in: 0..<64, using: &rng)) }
+        for b in flipped { h ^= 1 << UInt64(b) }
+        return h
+    }
+
+    func randomFrames(_ n: Int) -> [UInt64] { (0..<n).map { _ in UInt64.random(in: .min ... .max, using: &rng) } }
+
+    func library() -> [VideoClip] {
+        let original = randomFrames(80)
+        let other = randomFrames(70)
+        return [
+            VideoClip(id: "original", size: 300_000_000, duration: 20, width: 1920, height: 1080, frames: original, poster: original[0]),
+            VideoClip(id: "re-encoded", size: 120_000_000, duration: 20.03, width: 1920, height: 1080,
+                      frames: original.map { noise($0, 2) }, poster: noise(original[0], 2)),
+            VideoClip(id: "trimmed", size: 50_000_000, duration: 8, width: 1920, height: 1080,
+                      frames: original[20..<52].map { noise($0, 3) }),
+            VideoClip(id: "icloud copy", size: 280_000_000, duration: 20.2, width: 1920, height: 1080, cloudOnly: true,
+                      frames: [], poster: noise(original[0], 3)),
+            VideoClip(id: "twin A", size: 77_000_000, duration: 12.0, width: 1280, height: 720, frames: []),
+            VideoClip(id: "twin B", size: 77_000_000, duration: 12.04, width: 1280, height: 720, frames: []),
+            // most of its frames are the start of `other`, but it's nearly as long: alike, not trimmed
+            VideoClip(id: "lookalike", size: 90_000_000, duration: 33, width: 1920, height: 1080,
+                      frames: other[0..<20].map { noise($0, 2) } + randomFrames(4)),
+            VideoClip(id: "other", size: 200_000_000, duration: 35, width: 1920, height: 1080, frames: other),
+            VideoClip(id: "unrelated", size: 150_000_000, duration: 20, width: 1920, height: 1080, frames: randomFrames(80)),
+        ]
+    }
+
+    func kinds(_ clips: [VideoClip], _ s: Strictness) -> [String: MatchKind] {
+        Dictionary(uniqueKeysWithValues: VideoMatcher.findMatches(clips, strictness: s)
+            .map { ([clips[$0.a].id, clips[$0.b].id].sorted().joined(separator: "+"), $0.kind) })
+    }
+
+    func testMatchKinds() {
+        let clips = library()
+        let k = kinds(clips, .balanced)
+        XCTAssertEqual(k["original+re-encoded"], .same)
+        XCTAssertEqual(k["original+trimmed"], .trimmed)
+        XCTAssertEqual(k["icloud copy+original"], .same, "an iCloud-only copy matches by its poster and length")
+        XCTAssertEqual(k["twin A+twin B"], .identical)
+        XCTAssertEqual(k["lookalike+other"], .similar)
+        XCTAssertNil(k.keys.first { $0.contains("unrelated") }, "unrelated videos never match")
+    }
+
+    func testStrictLeavesOutLookalikes() {
+        let k = kinds(library(), .strict)
+        XCTAssertNil(k["lookalike+other"])
+        XCTAssertEqual(k["original+trimmed"], .trimmed, "trimmed clips are copies, so strict keeps them")
+    }
+
+    func testSetsKeepTheLongestBestCopy() {
+        var clips = library()
+        let sets = VideoMatcher.buildSets(clips, matches: VideoMatcher.findMatches(clips, strictness: .balanced))
+        let first = sets[0].members.map { "\(clips[$0.index].id):\($0.suggestion.rawValue)" }
+        XCTAssertEqual(first.first, "original:keep")
+        XCTAssertEqual(Set(first.dropFirst()), ["re-encoded:delete", "icloud copy:delete", "trimmed:delete"])
+        let lookalikes = sets.first { $0.members.contains { clips[$0.index].id == "lookalike" } }!
+        XCTAssertEqual(clips[lookalikes.keeper].id, "other")
+        XCTAssertEqual(lookalikes.members[1].suggestion, .review)
+
+        clips[2].favorite = true                     // a favourite trimmed clip is only for review
+        let again = VideoMatcher.buildSets(clips, matches: VideoMatcher.findMatches(clips, strictness: .balanced))
+        let trimmed = again[0].members.first { clips[$0.index].id == "trimmed" }!
+        XCTAssertEqual(trimmed.suggestion, .review)
+    }
+
+    func testFrameTimes() {
+        XCTAssertEqual(VideoMatcher.frameTimes(duration: 10).count, 40, "4 a second")
+        XCTAssertEqual(VideoMatcher.frameTimes(duration: 600).count, 160, "at most 160")
+        XCTAssertLessThan(VideoMatcher.frameTimes(duration: 600).last!, 600)
+    }
+
+    func testFrameHashSkipsDarkAndFlatFrames() {
+        XCTAssertNil(Fingerprint.frameHash(gray: [UInt8](repeating: 5, count: 90 * 80), width: 90, height: 80), "dark")
+        XCTAssertNil(Fingerprint.frameHash(gray: [UInt8](repeating: 120, count: 90 * 80), width: 90, height: 80), "flat")
+        let gradient = (0..<(90 * 80)).map { UInt8(40 + ($0 % 90) * 2) }
+        XCTAssertNotNil(Fingerprint.frameHash(gray: gradient, width: 90, height: 80))
+    }
+}
+
+/// Random numbers that are the same every run, so the tests are too.
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}

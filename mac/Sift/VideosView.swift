@@ -34,6 +34,7 @@ struct VideosView: View {
                     Text("Slo-mo, time-lapse and edited videos are left out, because re-saving them would lose those effects.")
                         .font(.callout)
                         .foregroundStyle(Theme.muted)
+                    outputOptions
                 }
             }
             .padding(.horizontal, 24)
@@ -44,18 +45,30 @@ struct VideosView: View {
                     .foregroundStyle(Theme.muted)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                HStack {
+                    Text(Format.plural(model.candidates.count, "video") + " could be smaller").foregroundStyle(Theme.muted)
+                    Spacer()
+                    Picker("Sort", selection: $model.videoSort) {
+                        ForEach(AppModel.VideoSort.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 14)
                 ScrollView {
                     LazyVStack(spacing: 10) {
-                        ForEach(model.candidates) { VideoRow(candidate: $0) }
+                        ForEach(model.sortedCandidates) { VideoRow(candidate: $0) }
                     }
-                    .padding(24)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
                 }
                 Rectangle().fill(Theme.border).frame(height: 1)
                 HStack(spacing: 10) {
                     Button("Select All") { model.chosenVideos = Set(model.candidates.map(\.id)) }.buttonStyle(.secondary)
                     Button("Select None") { model.chosenVideos = [] }.buttonStyle(.secondary)
                     Spacer()
-                    Text("Each copy goes into Photos with the original's date, place, favourite and albums.")
+                    Text("Each copy is named like “IMG_1234 - sift compression.MOV”.")
                         .font(.callout)
                         .foregroundStyle(Theme.muted)
                     Button("Make \(Format.plural(model.videosToCompress.count, "Smaller Copy", "Smaller Copies"))") {
@@ -63,13 +76,47 @@ struct VideosView: View {
                     }
                     .buttonStyle(.primary)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(model.videosToCompress.isEmpty)
+                    .disabled(!model.canCompress)
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 14)
                 .background(Theme.surface)
             }
         }
+    }
+}
+
+extension VideosView {
+    /// Where the copies go: into Photos, and/or a folder where each sits next to a copy of
+    /// its original, for comparing in the Finder.
+    var outputOptions: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Import the copies into Photos, with each original's date, place, favourite and albums",
+                   isOn: $model.importToPhotos)
+            HStack(spacing: 10) {
+                Toggle("Also save each copy in a folder, next to a copy of its original", isOn: $model.saveToFolder)
+                    .onChange(of: model.saveToFolder) { _, on in
+                        if on && model.comparisonFolder == nil { model.chooseComparisonFolder() }
+                        if model.comparisonFolder == nil { model.saveToFolder = false }
+                    }
+                Button(model.comparisonFolder == nil ? "Choose Folder…" : "Change…") { model.chooseComparisonFolder() }
+                    .buttonStyle(.secondary)
+                    .controlSize(.small)
+                if let folder = model.comparisonFolder {
+                    Label(folder.lastPathComponent, systemImage: "folder")
+                        .font(.callout)
+                        .foregroundStyle(Theme.muted)
+                        .help(folder.path)
+                }
+            }
+            if !model.importToPhotos && !model.saveToFolder {
+                Text("Choose at least one place for the copies.").font(.callout).foregroundStyle(Theme.danger)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: Theme.radius).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radius).strokeBorder(Theme.border))
     }
 }
 
@@ -167,20 +214,28 @@ struct CompressedView: View {
 
     var body: some View {
         let ok = model.compressedOK
+        let inPhotos = model.compressedInPhotos
+        let inFolder = ok.contains { $0.file != nil }
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Eyebrow(text: "Make videos smaller")
                 Text(ok.isEmpty ? "No smaller copies were made"
                      : "Made \(Format.plural(ok.count, "smaller copy", "smaller copies")), saving \(Format.size(model.compressedSaving))")
                     .font(Theme.display(30))
-                if !ok.isEmpty {
+                if !inPhotos.isEmpty {
                     Text("They're in Photos with the same dates, places, favourites and albums as the originals. To compare "
                          + "them, open the album “\(VideoCompressor.albumCompare)”, where each original sits next to its copy.")
                         .foregroundStyle(Theme.ink2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if inFolder, let folder = model.lastFolderUsed {
+                    Text("They're also in “\(folder.lastPathComponent)”, each next to a copy of its original, named like "
+                         + "“IMG_1234 - sift compression.MOV”.")
+                        .foregroundStyle(Theme.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            if !ok.isEmpty {
+            if !inPhotos.isEmpty {
                 Label(model.originalsDeleted ? (model.message ?? "Originals deleted.")
                       : "When you're happy with the copies, delete the originals to free the space.",
                       systemImage: model.originalsDeleted ? "checkmark.circle" : "info.circle")
@@ -215,9 +270,12 @@ struct CompressedView: View {
             HStack(spacing: 10) {
                 Button("Done") { model.stage = .start }.buttonStyle(.secondary)
                 Spacer()
+                if inFolder {
+                    Button("Show in Finder") { model.openComparisonFolder() }.buttonStyle(.secondary)
+                }
                 Button("Open Photos") { model.openPhotos() }.buttonStyle(.secondary)
-                if !ok.isEmpty && !model.originalsDeleted {
-                    Button("Delete \(Format.plural(ok.count, "Original"))…") { model.requestDeleteOriginals() }
+                if !inPhotos.isEmpty && !model.originalsDeleted {
+                    Button("Delete \(Format.plural(inPhotos.count, "Original"))…") { model.requestDeleteOriginals() }
                         .buttonStyle(.danger)
                         .disabled(model.deleting)
                 }

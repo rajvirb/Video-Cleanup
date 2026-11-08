@@ -39,6 +39,9 @@ targets:
         # the App Store requires the sandbox; this is the only door Sift needs through it
         com.apple.security.app-sandbox: true
         com.apple.security.personal-information.photos-library: true
+        # the comparison folder: one the person picks, remembered between launches
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.bookmarks.app-scope: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rajvirb.siftapp
