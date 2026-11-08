@@ -101,16 +101,11 @@ struct SidebarView: View {
                     if model.googleSignedIn { Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.success) }
                 }
             }
+            Section {
+                Label("Support Sift", systemImage: "heart").tag(AppModel.SidebarItem.support)
+            }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            List(selection: Binding(get: { model.sidebar }, set: { model.select($0) })) {
-                Label("Support Sift", systemImage: "heart").tag(Optional(AppModel.SidebarItem.support))
-            }
-            .listStyle(.sidebar)
-            .frame(height: 44)
-            .scrollDisabled(true)
-        }
         .disabled(model.stage == .scanning || model.stage == .compressing)
     }
 
@@ -121,7 +116,9 @@ struct SidebarView: View {
     }
 
     private func row(_ item: AppModel.SidebarItem, _ title: String, _ symbol: String) -> some View {
-        Label(title, systemImage: symbol).tag(Optional(item))
+        // The tag must be a plain SidebarItem, the same type the list's selection holds, or
+        // clicking the row selects nothing.
+        Label(title, systemImage: symbol).tag(item)
     }
 }
 
