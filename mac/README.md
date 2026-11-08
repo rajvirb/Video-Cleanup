@@ -4,14 +4,18 @@ The native version of Sift, written in Swift with SwiftUI, for the Mac App Store
 Apple's Photos framework (PhotoKit), so it asks for access to your photos the normal way.
 It doesn't need Full Disk Access, AppleScript or Terminal.
 
-It does two things so far:
+It does three things, each across your whole library or just the albums and folders you tick:
 
 - **Find Duplicate Photos:** copies and similar shots, to review, compare side by side in full
   quality, and delete.
+- **Find Duplicate Videos:** identical copies, re-saved versions and trimmed clips of the same
+  video (and, unless you choose Strict, videos that look alike), to review, play side by side,
+  and delete.
 - **Make Videos Smaller:** finds videos stored in older, bulkier formats and makes smaller
-  HEVC copies of the ones you choose. Each copy keeps its date, place, camera and lens, and goes
-  into Photos with the original's favourite status and albums, so you can compare them before
-  deleting the originals.
+  HEVC copies of the ones you choose, sorted however you like. Each copy is named after its
+  original, like `IMG_1234 - sift compression.MOV`, and keeps its date, place, camera and lens.
+  Copies can go into Photos (with the original's favourite status and albums), and/or into a
+  folder you choose, each next to a copy of its original, for comparing in the Finder.
 
 **Nothing is ever deleted without asking you twice.** First Sift shows its own summary of
 exactly what will be deleted: how many, how much space, favourites, edited photos, Live Photos,
@@ -82,14 +86,14 @@ GitHub builds the app and runs the tests on every push (the **Native app** job u
 1. **Photos** (done): duplicates and similar shots, review, compare, delete.
 2. **Making videos smaller** (done): hardware HEVC copies saved back to Photos with each video's
    date, place, camera and lens.
-3. **Duplicate videos:** copies and trimmed clips, using AVFoundation to read frames.
+3. **Duplicate videos** (done): copies and trimmed clips, using AVFoundation to read frames.
 4. **App Store preparation**, which needs the **Apple Developer Program** ($99 a year):
    - your team in `project.yml`, and an App Store Connect record for Sift;
    - a privacy manifest (Sift collects no data) and the App Privacy answers;
    - screenshots, a description, keywords and a support page;
    - a TestFlight build to try on your Mac, then submission for review.
 
-Already done for the App Store: the app runs in the **App Sandbox** with only the Photos
-entitlement, and bundles no GPL code. One thing to settle before submitting: photo file sizes
+Already done for the App Store: the app runs in the **App Sandbox**, with only the Photos
+entitlement and access to folders you choose yourself, and bundles no GPL code. One thing to settle before submitting: photo file sizes
 come from an undocumented PhotoKit property (`fileSize`). Many App Store apps use it, but if
 App Review objects, sizes can be estimated another way.
