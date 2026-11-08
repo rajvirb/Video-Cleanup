@@ -274,7 +274,7 @@ final class VideoMatchingTests: XCTestCase {
     func testFrameHashSkipsDarkAndFlatFrames() {
         XCTAssertNil(Fingerprint.frameHash(gray: [UInt8](repeating: 5, count: 90 * 80), width: 90, height: 80), "dark")
         XCTAssertNil(Fingerprint.frameHash(gray: [UInt8](repeating: 120, count: 90 * 80), width: 90, height: 80), "flat")
-        let gradient = (0..<(90 * 80)).map { UInt8(40 + ($0 % 90) * 2) }
+        let gradient: [UInt8] = (0..<7200).map { (i: Int) -> UInt8 in UInt8(40 + (i % 90) * 2) }
         XCTAssertNotNil(Fingerprint.frameHash(gray: gradient, width: 90, height: 80))
     }
 }
