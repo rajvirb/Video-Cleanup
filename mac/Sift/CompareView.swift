@@ -16,10 +16,10 @@ struct CompareView: View {
             let markedHere = set.members.map { model.items[$0.index].id }.filter { model.marked.contains($0) }
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
-                    Text("Set \(k + 1) of \(model.sets.count) · \(Format.plural(set.members.count, "photo"))").bold()
-                    Text("← → switch set · 1–9 keep or delete · Z zoom")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Set \(k + 1) of \(model.sets.count)").font(Theme.display(17, bold: false))
+                        Text("← → switch set · 1–9 keep or delete · Z zoom").font(.caption).foregroundStyle(Theme.muted)
+                    }
                     Spacer()
                     Picker("Zoom", selection: $zoom) {
                         Text("Fit").tag(CGFloat(1))
@@ -29,26 +29,35 @@ struct CompareView: View {
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .frame(width: 150)
-                    Button("Keep All") { model.keepAll(set) }
-                    Button("Previous", systemImage: "chevron.left") { model.comparing = k - 1 }
+                    Button("Keep All") { model.keepAll(set) }.buttonStyle(.secondary)
+                    Button { model.comparing = k - 1 } label: { Image(systemName: "chevron.left") }
+                        .buttonStyle(.secondary)
                         .keyboardShortcut(.leftArrow, modifiers: [])
                         .disabled(k == 0)
-                    Button("Next", systemImage: "chevron.right") { model.comparing = k + 1 }
+                        .help("Previous set")
+                    Button { model.comparing = k + 1 } label: { Image(systemName: "chevron.right") }
+                        .buttonStyle(.secondary)
                         .keyboardShortcut(.rightArrow, modifiers: [])
                         .disabled(k >= model.sets.count - 1)
-                    Button(role: .destructive) {
+                        .help("Next set")
+                    Button(markedHere.isEmpty ? "Delete" : "Delete \(markedHere.count)…") {
                         model.requestDelete(Set(markedHere))
-                    } label: {
-                        Text(markedHere.isEmpty ? "Delete" : "Delete \(markedHere.count)")
                     }
+                    .buttonStyle(.danger)
                     .disabled(markedHere.isEmpty || model.deleting)
                     Button("Done") { dismiss() }
+                        .buttonStyle(.primary)
                         .keyboardShortcut(.cancelAction)
                 }
-                .padding(12)
-                Divider()
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Theme.surface)
+                Rectangle().fill(Theme.border).frame(height: 1)
                 panels(set)
             }
+            .background(Theme.bg)
+            .foregroundStyle(Theme.ink)
+            .tint(Theme.accent)
             .frame(minWidth: 900, idealWidth: 1300, minHeight: 620, idealHeight: 860)
             .focusable()
             .focused($focused)
@@ -79,11 +88,11 @@ struct CompareView: View {
             let n = set.members.count
             let cols = n <= 3 ? n : (n == 4 ? (geo.size.width > 1400 ? 4 : 2) : (geo.size.width > 1400 ? 4 : 3))
             let rows = Int(ceil(Double(n) / Double(cols)))
-            let height = max(320, (geo.size.height - 12 * Double(rows + 1)) / Double(rows))
+            let height = max(320, (geo.size.height - 14 * Double(rows + 1)) / Double(rows))
             let maxPixels = set.members.map { model.items[$0.index].pixels }.max() ?? 0
             let maxSize = set.members.map { model.items[$0.index].size }.max() ?? 0
             ScrollView {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: cols), spacing: 12) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: cols), spacing: 14) {
                     ForEach(Array(set.members.enumerated()), id: \.element.index) { i, member in
                         let item = model.items[member.index]
                         ComparePanel(item: item, member: member, number: i + 1, marked: model.marked.contains(item.id),
@@ -94,7 +103,7 @@ struct CompareView: View {
                             .frame(height: height)
                     }
                 }
-                .padding(12)
+                .padding(14)
             }
         }
     }
@@ -132,6 +141,7 @@ struct ComparePanel: View {
                     }
                     .scaleEffect(zoom, anchor: anchor)
                     .animation(.easeOut(duration: 0.12), value: zoom)
+                    .opacity(marked ? 0.6 : 1)
                 }
                 .clipped()
                 .contentShape(Rectangle())
@@ -143,46 +153,56 @@ struct ComparePanel: View {
                 .onTapGesture(perform: toggleZoom)
                 .overlay(alignment: .topLeading) {
                     HStack(alignment: .top) {
-                        Tag(text: marked ? "DELETE" : "KEEP", color: marked ? .red : .green)
+                        KeepDeleteTag(marked: marked)
                         Spacer()
                         Badges(item: item, member: member)
                     }
-                    .padding(8)
+                    .padding(9)
                 }
                 .overlay(alignment: .bottomLeading) {
                     Text("\(number)")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(.black.opacity(0.6)))
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 20, height: 20)
+                        .background(Circle().fill(.black.opacity(0.55)))
                         .foregroundStyle(.white)
-                        .padding(8)
+                        .padding(9)
                 }
-                .overlay(alignment: .bottomTrailing) { status.padding(8) }
+                .overlay(alignment: .bottomTrailing) { status.padding(9) }
             }
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Text(item.name).fontWeight(.semibold).lineLimit(1)
-                        if member.suggestion == .keep { Text("★ Best copy").foregroundStyle(.green).fontWeight(.semibold) }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(item.name).fontWeight(.semibold).lineLimit(1)
+                    if member.suggestion == .keep {
+                        Pill(text: "★ Best copy", color: Theme.accentText, background: Theme.accentSoft)
                     }
-                    HStack(spacing: 8) {
-                        if let date = item.date { Text(date.formatted(date: .abbreviated, time: .shortened)) }
-                        Text("\(item.width)×\(item.height)").fontWeight(bestPixels ? .semibold : .regular)
-                        if item.size > 0 { Text(Format.size(item.size)).fontWeight(bestSize ? .semibold : .regular) }
+                    Spacer()
+                    Button(marked ? "Keep" : "Delete") { model.toggle(item.id) }
+                        .buttonStyle(SecondaryButtonStyle(tint: marked ? Theme.ink : Theme.danger))
+                    Button("Keep Only This", action: keepOnly).buttonStyle(.secondary)
+                }
+                HStack(spacing: 8) {
+                    if let date = item.date { Text(date.formatted(date: .abbreviated, time: .shortened)) }
+                    Text("\(item.width)×\(item.height)")
+                        .fontWeight(bestPixels ? .semibold : .regular)
+                        .foregroundStyle(bestPixels ? Theme.ink : Theme.muted)
+                    if item.size > 0 {
+                        Text(Format.size(item.size))
+                            .fontWeight(bestSize ? .semibold : .regular)
+                            .foregroundStyle(bestSize ? Theme.ink : Theme.muted)
                     }
-                    .foregroundStyle(.secondary)
-                    if member.suggestion != .keep { Text(member.reason).lineLimit(2) }
                 }
                 .font(.callout)
-                Spacer()
-                Button(marked ? "Keep" : "Delete") { model.toggle(item.id) }
-                Button("Keep Only This", action: keepOnly)
+                .foregroundStyle(Theme.muted)
+                if member.suggestion != .keep {
+                    Text(member.reason).font(.callout).foregroundStyle(Theme.ink2).lineLimit(2)
+                }
             }
-            .padding(10)
+            .padding(11)
         }
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(marked ? Color.red : Color.green, lineWidth: 3))
+        .background(Theme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusLarge))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusLarge)
+            .strokeBorder(marked ? Theme.danger : Theme.border, lineWidth: marked ? 2 : 1))
         .task(id: item.id) {
             loading = true
             full = nil
@@ -195,24 +215,26 @@ struct ComparePanel: View {
 
     @ViewBuilder private var status: some View {
         if loading {
-            Label(downloaded > 0 ? "Downloading from iCloud… \(Int(downloaded * 100))%" : "Loading full quality…",
-                  systemImage: "icloud.and.arrow.down")
-                .modifier(Pill(color: .black.opacity(0.7)))
+            StatusLabel(text: downloaded > 0 ? "Downloading from iCloud… \(Int(downloaded * 100))%" : "Loading full quality…",
+                        symbol: "icloud.and.arrow.down", background: .black.opacity(0.6))
         } else if !isFullQuality {
-            Label("Preview only: the full-quality version couldn't be loaded", systemImage: "exclamationmark.triangle")
-                .modifier(Pill(color: .orange.opacity(0.9)))
+            StatusLabel(text: "Preview only: the full-quality version couldn't be loaded",
+                        symbol: "exclamationmark.triangle", background: Color(red: 0.62, green: 0.4, blue: 0.08).opacity(0.92))
         }
     }
 }
 
-struct Pill: ViewModifier {
-    let color: Color
+/// A note on top of a photo, such as "Loading full quality…".
+struct StatusLabel: View {
+    let text: String
+    let symbol: String
+    let background: Color
 
-    func body(content: Content) -> some View {
-        content
+    var body: some View {
+        Label(text, systemImage: symbol)
             .font(.caption)
-            .padding(.horizontal, 9).padding(.vertical, 3)
-            .background(Capsule().fill(color))
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background(Capsule().fill(background))
             .foregroundStyle(.white)
     }
 }
