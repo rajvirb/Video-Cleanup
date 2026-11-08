@@ -9,7 +9,7 @@
 # ///
 
 """
-Video Cleanup — find duplicate and space-wasting videos (or photos) in your Photos library.
+Sift — find duplicate and space-wasting videos (or photos) in your Photos library.
 
 It only READS your library. It never deletes anything. It writes an HTML report
 and, if you agree, adds the duplicates it finds to an album in Photos so you can
@@ -30,12 +30,13 @@ same moment), and similar shots such as bursts and retakes (for you to choose
 between), plus your biggest photos and screenshots.
 
 Usage
-  uv run video_cleanup.py                 # scan your Photos library
-  uv run video_cleanup.py --folder DIR    # scan a folder of video files instead
+  uv run sift.py                 # scan your Photos library
+  uv run sift.py --folder DIR    # scan a folder of video files instead
   options: --media videos|photos, --strictness strict|balanced|loose, --largest N,
            --compress no|same|1080p, --import / --no-import, --keep-copies,
            --download-missing / --no-download, --make-albums / --no-albums,
            --out DIR, --library PATH, --album NAME
+  uv run sift.py --review REPORT_FOLDER    # reopen the review page for an earlier scan
 """
 from __future__ import annotations
 
@@ -44,10 +45,10 @@ try:
 except ImportError:
     import os, shutil, sys
     uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
-    if os.environ.get("VIDEO_CLEANUP_VIA_UV") or not os.path.exists(uv):
+    if os.environ.get("SIFT_VIA_UV") or not os.path.exists(uv):
         sys.exit("Missing packages. Install uv (https://docs.astral.sh/uv/) "
-                 "and run:  uv run video_cleanup.py")
-    os.environ["VIDEO_CLEANUP_VIA_UV"] = "1"
+                 "and run:  uv run sift.py")
+    os.environ["SIFT_VIA_UV"] = "1"
     os.execv(uv, [uv, "run", "--script", os.path.abspath(__file__), *sys.argv[1:]])
 
 import argparse
@@ -80,11 +81,11 @@ MIN_INFORMATIVE = 3      # need this many non-blank frames to compare by content
 POSTER_MATCH_BITS = 6    # poster-frame match for videos we can't open (iCloud-only)
 SHORT_CLIP_SECS = 3.0
 BIGGEST_COUNT = 40
-ALBUM_DUPES = "Video Cleanup - Duplicated & Trimmed Videos"        # every video in a duplicate set
-ALBUM_ORIGINALS = "Video Cleanup - Original Videos"              # originals that now have a smaller copy
-ALBUM_COMPRESSED = "Video Cleanup - Compressed Versions"         # the smaller copies
-ALBUM_COMPARE = "Video Cleanup - Original & Compressed Comparison"  # each original next to its copy
-PHOTO_ALBUM_DUPES = "Photo Cleanup - Duplicate & Similar Photos"   # every photo in a duplicate set
+ALBUM_DUPES = "Sift - Duplicated & Trimmed Videos"        # every video in a duplicate set
+ALBUM_ORIGINALS = "Sift - Original Videos"              # originals that now have a smaller copy
+ALBUM_COMPRESSED = "Sift - Compressed Versions"         # the smaller copies
+ALBUM_COMPARE = "Sift - Original & Compressed Comparison"  # each original next to its copy
+PHOTO_ALBUM_DUPES = "Sift - Duplicate & Similar Photos"   # every photo in a duplicate set
 PHOTO_SAME_BITS = 24     # photos whose 256-bit hashes differ by <= this look the same
 COPY_SECONDS = 0.5       # …and are copies if they were also taken at the same moment
 # How strict the comparison is. Strict only finds copies; balanced and loose also
@@ -99,12 +100,13 @@ STRICTNESS = {
                  "photo_bits": 64, "window": 3600},
 }
 VIDEO_SIMILAR = True     # look for similar (not just copied) videos; set by the strictness
-COMPRESS_DIR = Path.home() / "Movies" / "Video Cleanup" / "Compressed"
+COMPRESS_DIR = Path.home() / "Movies" / "Sift" / "Compressed"
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp", ".mts", ".webm"}
-CACHE_FILE = Path.home() / ".cache" / "video-cleanup" / "hashes.json"
+CACHE_FILE = Path.home() / ".cache" / "sift" / "hashes.json"
+OLD_CACHE_FILE = Path.home() / ".cache" / "video-cleanup" / "hashes.json"   # from before the rename
 # Set by the Mac app (app.py): questions and progress are sent to the app's window
 # as "@@{json}" lines on stdout, and the answers come back on stdin.
-GUI = os.environ.get("VIDEO_CLEANUP_GUI") == "1"
+GUI = os.environ.get("SIFT_GUI") == "1"
 
 
 # ---------------------------------------------------------------- model
@@ -139,6 +141,7 @@ class Video:
     burst: bool = False
     live: bool = False
     raw: bool = False
+    edited_path: str | None = None   # the edited version, when there is one on this Mac
 
     @property
     def cloud_only(self) -> bool:
@@ -308,10 +311,12 @@ def poster_from_video(ff: str, path: str) -> int | None:
 
 # ---------------------------------------------------------------- cache
 def load_cache() -> dict:
-    try:
-        return json.loads(CACHE_FILE.read_text())
-    except Exception:
-        return {}
+    for f in (CACHE_FILE, OLD_CACHE_FILE):     # keep fingerprints made before the rename
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return {}
 
 
 def save_cache(cache: dict) -> None:
@@ -511,6 +516,11 @@ def load_from_photos(library: str | None, albums: list[str] | None = None,
     return videos, source
 
 
+def edited_path(p) -> str | None:
+    path = getattr(p, "path_edited", None) if getattr(p, "hasadjustments", False) else None
+    return path if path and os.path.exists(path) else None
+
+
 def photo_item(p) -> Video:
     path = p.path if (p.path and os.path.exists(p.path)) else None
     previews = sorted((d for d in (getattr(p, "path_derivatives", None) or [])
@@ -534,6 +544,7 @@ def photo_item(p) -> Video:
         burst=bool(getattr(p, "burst", False)),
         live=bool(getattr(p, "live_photo", False)),
         raw=bool(getattr(p, "has_raw", False) or getattr(p, "israw", False)),
+        edited_path=edited_path(p),
         meta=photo_meta(p),
     )
 
@@ -1031,6 +1042,37 @@ def card(v: Video, thumb: str | None, badge: str = "", note: str = "") -> str:
 </div>"""
 
 
+def write_review_data(items: list[Video], groups: list[Group], thumbs: dict, out_dir: Path,
+                      source_label: str) -> None:
+    """Save the duplicate sets for the review page (review.py), which lets you go through
+    them, mark what to keep and delete, and compare copies side by side in full quality."""
+    def entry(m: int, g: Group) -> dict:
+        v = items[m]
+        action, reason = ("keep", "Suggested copy to keep") if m == g.keeper else g.action[m]
+        return {
+            "id": v.id, "name": v.filename, "date": v.date.isoformat() if v.date else "",
+            "width": v.width, "height": v.height, "size": v.size, "duration": round(v.duration or 0, 2),
+            "favorite": v.favorite, "edited": v.edited, "live": v.live, "burst": v.burst, "raw": v.raw,
+            "cloud_only": v.cloud_only, "action": action, "reason": reason,
+            "thumb": thumbs.get(m), "preview": v.thumb_src, "orig": v.path, "edited_path": v.edited_path,
+        }
+    sets = []
+    for g in groups:
+        order = [g.keeper] + sorted((m for m in g.members if m != g.keeper),
+                                    key=lambda m: (g.action[m][0] != "delete", -items[m].size))
+        sets.append([entry(m, g) for m in order])
+    old = {}
+    try:
+        old = json.loads((out_dir / "review.json").read_text())
+    except Exception:
+        pass
+    data = {"kind": items[0].kind if items else "video", "source": source_label,
+            "scanned": dt.datetime.now().isoformat(timespec="seconds"), "groups": sets,
+            # items already sent to the delete album stay hidden if the same scan is run again
+            "sent": old.get("sent", [])}
+    (out_dir / "review.json").write_text(json.dumps(data))
+
+
 def group_sections(videos: list[Video], groups: list[Group], thumbs: dict) -> str:
     """The report's duplicate sets: Keep first, then Delete, then Review."""
     photo = bool(videos) and videos[0].kind == "photo"
@@ -1089,10 +1131,10 @@ def write_photo_report(photos: list[Video], groups: list[Group], ff: str, out_di
     now = dt.datetime.now().strftime("%-d %b %Y, %H:%M")
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Photo Cleanup</title>
+<title>Sift - Photos</title>
 <style>
 {REPORT_CSS}</style></head><body><main>
-<h1>Photo Cleanup</h1>
+<h1>Sift: photos</h1>
 <p class="sub">{e(source_label)} · scanned {now} · nothing has been deleted</p>
 <div class="stats">
   <div class="stat"><div class="n">{len(photos):,}</div><div class="l">photos · {human_size(total)}</div></div>
@@ -1130,10 +1172,11 @@ ones saved from a message, are marked <b>Review</b>.
 {f"{plural(unread, 'photo')} couldn't be read, so they were left out." if unread else ""}
 Deleting a photo moves it to Recently Deleted. The iCloud space is only freed once it leaves there,
 either after 30 days or when you empty it.</p>
-<footer>Video Cleanup only reads your library. Thumbnails are stored next to this page.</footer>
+<footer>Sift only reads your library. Thumbnails are stored next to this page.</footer>
 </main></body></html>"""
     out = out_dir / "index.html"
     out.write_text(page, encoding="utf-8")
+    write_review_data(photos, groups, thumbs, out_dir, source_label)
     return out
 
 
@@ -1223,10 +1266,10 @@ def write_report(videos: list[Video], groups: list[Group], ff: str, out_dir: Pat
     now = dt.datetime.now().strftime("%-d %b %Y, %H:%M")
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Video Cleanup</title>
+<title>Sift - Videos</title>
 <style>
 {REPORT_CSS}</style></head><body><main>
-<h1>Video Cleanup</h1>
+<h1>Sift: videos</h1>
 <p class="sub">{html.escape(source_label)} · scanned {now} · nothing has been deleted</p>
 <div class="stats">
   <div class="stat"><div class="n">{len(videos)}</div><div class="l">videos · {human_size(total)}</div></div>
@@ -1276,10 +1319,11 @@ and looks for them in every other video. That finds copies even when they've bee
 {f"{cloud_unchecked} videos are stored only in iCloud, so they were compared using Photos' preview image, length and size instead, which catches exact and re-saved copies but not trimmed ones." if cloud_unchecked else ""}
 Deleting a video moves it to Recently Deleted. The iCloud space is only freed once it leaves there,
 either after 30 days or when you empty it.</p>
-<footer>Video Cleanup only reads your library. Thumbnails are stored next to this page.</footer>
+<footer>Sift only reads your library. Thumbnails are stored next to this page.</footer>
 </main></body></html>"""
     out = out_dir / "index.html"
     out.write_text(page, encoding="utf-8")
+    write_review_data(videos, groups, thumbs, out_dir, source_label)
     return out
 
 
@@ -1721,7 +1765,7 @@ def can_control_photos() -> bool:
                 gui_send("automation")
             print("  macOS isn't letting this control Photos, so albums, iCloud downloads and "
                   "imports are skipped. To allow it: System Settings › Privacy & Security › "
-                  f"Automation › {'Video Cleanup' if GUI else 'Terminal (or the app you ran this from)'}"
+                  f"Automation › {'Sift' if GUI else 'Terminal (or the app you ran this from)'}"
                   " › turn on Photos, then run it again.")
     return _photos_allowed
 
@@ -1930,6 +1974,21 @@ def apply_strictness(level: str) -> None:
     POSTER_MATCH_BITS, VIDEO_SIMILAR = cfg["poster_bits"], cfg["similar"]
 
 
+def finish(out: Path, groups: list, args, t0: float) -> None:
+    """Say where the report is, then open the review page (if there's anything to review)
+    or the report. In the app, the app does the opening."""
+    print(f"\nReport: {out}")
+    print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
+    if GUI:
+        return
+    if groups and sys.stdin.isatty() and ask("Open the review page, to go through the sets and choose "
+                                             "what to delete?", True):
+        import review
+        review.serve(out.parent, open_browser=not args.no_open)
+    elif not args.no_open:
+        webbrowser.open(out.as_uri())
+
+
 def clean_up_photos(photos: list[Video], source: str, level: str, args, ff: str, t0: float) -> None:
     """The photo version of the scan: fingerprint, group, album, report. (No compressing.)"""
     fingerprint_photos(photos)
@@ -1949,22 +2008,20 @@ def clean_up_photos(photos: list[Video], source: str, level: str, args, ff: str,
                        "so you can check and delete them on your iPhone?", True)
         if want:
             print("Adding the album in Photos (Photos will open; allow "
-                  f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
+                  f"{'Sift' if GUI else 'Terminal'} to control it if asked)…")
         if want and can_control_photos():
             try:
                 albums_made = make_albums(photos, groups, PHOTO_ALBUM_DUPES)
             except Exception as exc:
                 print(f"  Couldn't create the album: {exc}")
 
-    out_dir = Path(args.out or Path.home() / "Desktop" / "Photo Cleanup Report").expanduser()
+    out_dir = Path(args.out or Path.home() / "Desktop" / "Sift Report (Photos)").expanduser()
     out = write_report(photos, groups, ff, out_dir, source, albums_made, True)
     if GUI:
         gui_send("summary", noun="photo", scanned=len(photos), sets=len(groups), delete=n_delete,
-                 review=n_review, saving=human_size(saving), album=PHOTO_ALBUM_DUPES if albums_made else "")
-    print(f"\nReport: {out}")
-    print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
-    if not args.no_open:
-        webbrowser.open(out.as_uri())
+                 review=n_review, saving=human_size(saving), album=PHOTO_ALBUM_DUPES if albums_made else "",
+                 folder=str(out_dir))
+    finish(out, groups, args, t0)
 
 
 def main() -> None:
@@ -1998,7 +2055,15 @@ def main() -> None:
     ap.add_argument("--largest", type=int, metavar="N",
                     help="only scan your N largest videos (without it you're asked what to scan)")
     ap.add_argument("--no-open", action="store_true", help="don't open the report when done")
+    ap.add_argument("--review", metavar="REPORT_FOLDER",
+                    help="open the review page for an earlier scan's report folder, instead of scanning")
     args = ap.parse_args()
+
+    if args.review:
+        import review
+        announce = (lambda url: gui_send("review", url=url)) if GUI else None
+        review.serve(args.review, open_browser=not args.no_open, announce=announce)
+        return
 
     t0 = time.time()
     ff = ffmpeg_exe()
@@ -2068,7 +2133,7 @@ def main() -> None:
                        "so you can check and delete them on your iPhone?", True)
         if want:
             print("Adding albums in Photos (Photos will open; allow "
-                  f"{'Video Cleanup' if GUI else 'Terminal'} to control it if asked)…")
+                  f"{'Sift' if GUI else 'Terminal'} to control it if asked)…")
         if want and can_control_photos():
             try:
                 albums_made = make_albums(videos, groups)
@@ -2147,18 +2212,15 @@ def main() -> None:
                 "saved": saved, "dir": str(out_dir),
             }
 
-    out_dir = Path(args.out or Path.home() / "Desktop" / "Video Cleanup Report").expanduser()
+    out_dir = Path(args.out or Path.home() / "Desktop" / "Sift Report (Videos)").expanduser()
     out = write_report(videos, groups, ff, out_dir, source, albums_made, use_photos,
                        cands, comp_result)
     if GUI:
         gui_send("summary", noun="video", scanned=len(videos), sets=len(groups), delete=n_delete,
                  review=sum(1 for g in groups for a, _ in g.action.values() if a == "review"),
                  saving=human_size(saving), album=ALBUM_DUPES if albums_made else "",
-                 compressed=comp_result["done"] if comp_result else 0)
-    print(f"\nReport: {out}")
-    print(f"Done in {time.time() - t0:.0f}s. Nothing was deleted.")
-    if not args.no_open:
-        webbrowser.open(out.as_uri())
+                 compressed=comp_result["done"] if comp_result else 0, folder=str(out_dir))
+    finish(out, groups, args, t0)
 
 
 if __name__ == "__main__":
