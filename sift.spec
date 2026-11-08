@@ -1,4 +1,4 @@
-# PyInstaller recipe for "Video Cleanup.app". Build it with ./build_app.sh
+# PyInstaller recipe for "Sift.app". Build it with ./build_app.sh
 from importlib.metadata import PackageNotFoundError, distribution, packages_distributions
 
 from packaging.requirements import Requirement
@@ -33,7 +33,7 @@ modules = sorted({mod for mod, dists in packages_distributions().items()
                   if any(d.lower().replace("_", "-") in wanted for d in dists)
                   and mod.isidentifier()})
 
-datas, binaries, hiddenimports = [], [], ["video_cleanup"]
+datas, binaries, hiddenimports = [], [], ["sift", "review"]
 for mod in modules:
     d, b, h = collect_all(mod)
     datas += d
@@ -44,19 +44,19 @@ datas.append(("assets/icon.png", "assets"))     # the window's icon (app.py's as
 
 a = Analysis(["app.py"], datas=datas, binaries=binaries, hiddenimports=hiddenimports)
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Video Cleanup", console=False)
-coll = COLLECT(exe, a.binaries, a.datas, name="Video Cleanup")
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Sift", console=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="Sift")
 app = BUNDLE(
     coll,
-    name="Video Cleanup.app",
+    name="Sift.app",
     icon="assets/icon.icns",                     # drawn by tools/make_icon.py
-    bundle_identifier="com.rajvirb.videocleanup",
+    bundle_identifier="com.rajvirb.sift",
     info_plist={
         "CFBundleShortVersionString": "1.0.0",
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
         # shown when macOS asks to let the app control Photos
-        "NSAppleEventsUsageDescription": "Video Cleanup uses Photos to make review albums, "
+        "NSAppleEventsUsageDescription": "Sift uses Photos to make review albums, "
                                          "download videos stored in iCloud and import smaller copies.",
     },
 )

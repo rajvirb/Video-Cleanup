@@ -8,9 +8,9 @@
 # ]
 # ///
 """
-Video Cleanup — the Mac app.
+Sift — the Mac app.
 
-A small window around video_cleanup.py, so it can be used without Terminal.
+A small window around sift.py, so it can be used without Terminal.
 The scan runs in a separate process (this same program started with --worker).
 That process sends its questions and progress here as "@@{json}" lines, and
 reads the answers on stdin. Everything else it prints goes into the log.
@@ -30,10 +30,10 @@ import threading
 import webbrowser
 from pathlib import Path
 
-APP_NAME = "Video Cleanup"
+APP_NAME = "Sift"
 FDA_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 AUTOMATION_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
-BUNDLE_ID = "com.rajvirb.videocleanup"         # as in video_cleanup.spec
+BUNDLE_ID = "com.rajvirb.sift"         # as in sift.spec
 
 
 # ---------------------------------------------------------------- worker
@@ -44,15 +44,15 @@ def worker_command(*args: str) -> list[str]:
 
 
 def run_worker(args: list[str]) -> None:
-    import video_cleanup
+    import sift
     sys.argv = [APP_NAME, *args]
-    video_cleanup.main()
+    sift.main()
 
 
 def self_test() -> int:
     """Used by the build to check the finished app actually works."""
     import tempfile
-    import video_cleanup as vc
+    import sift as vc
     failed = False
 
     def report(ok: bool, what: str, warn_only: bool = False) -> None:
@@ -60,7 +60,7 @@ def self_test() -> int:
         print(f"{'ok  ' if ok else 'WARN' if warn_only else 'FAIL'}  {what}")
         failed |= not ok and not warn_only
 
-    mods = ["numpy", "PIL", "imageio_ffmpeg", "tkinter"]
+    mods = ["numpy", "PIL", "imageio_ffmpeg", "tkinter", "review"]
     if sys.platform == "darwin":
         mods += ["osxphotos", "photoscript"]
     for mod in mods:
@@ -79,6 +79,18 @@ def self_test() -> int:
 
     ff = vc.ffmpeg_exe()
     report(os.path.exists(ff), f"ffmpeg at {ff}")
+    try:                       # the review page's full-quality images (sips on a Mac)
+        import review
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "test.png")
+            Image.new("RGB", (5000, 3000), (40, 120, 200)).save(src)
+            jpeg = review.render_jpeg(src, 4096, 90, 5000, 3000)
+            from io import BytesIO
+            size = Image.open(BytesIO(jpeg)).size
+        report(max(size) == 4096, f"full-quality image for the review page: {size}")
+    except Exception as exc:
+        report(False, f"full-quality image for the review page: {exc}")
     with tempfile.TemporaryDirectory() as td:
         clip = os.path.join(td, "test.mp4")
         subprocess.run([ff, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:d=3",
@@ -227,13 +239,14 @@ class App:
 
         self.proc: subprocess.Popen | None = None
         self.events: queue.Queue = queue.Queue()
-        self.context: list[str] = []     # recent lines, shown above each question
         self.report: str | None = None
         self.summary: dict = {}
         self.stopping = False
         self.needs_fda = False
         self.asking = False
         self.progress_label, self.progress_started = "", 0.0
+        self.review_proc: subprocess.Popen | None = None   # the review page's server, once started
+        self.review_url = ""
 
         outer = ttk.Frame(root, padding=(26, 22, 26, 20))
         outer.pack(fill="both", expand=True)
@@ -310,7 +323,8 @@ class App:
         self.details_btn.pack(side="left")
         self.start_btn = ttk.Button(buttons, text="Start scan", command=self.start, default="active")
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop)
-        self.report_btn = ttk.Button(buttons, text="Open report", command=self.open_report, default="active")
+        self.review_btn = ttk.Button(buttons, text="Review & choose", command=self.open_review, default="active")
+        self.report_btn = ttk.Button(buttons, text="Open report", command=self.open_report)
         self.photos_btn = ttk.Button(buttons, text="Open Photos", command=self.open_photos)
         self.show("welcome", [self.start_btn])
 
@@ -325,7 +339,7 @@ class App:
         for p in self.panels.values():
             p.pack_forget()
         self.panels[panel].pack(fill="both", expand=True)
-        for b in (self.start_btn, self.stop_btn, self.report_btn, self.photos_btn):
+        for b in (self.start_btn, self.stop_btn, self.review_btn, self.report_btn, self.photos_btn):
             b.pack_forget()
         for k, b in enumerate(buttons):
             b.pack(side="right", padx=(0, 8) if k else 0)
@@ -340,6 +354,7 @@ class App:
 
     # ---- running the scan
     def start(self) -> None:
+        self.stop_review()
         self.stop_btn.configure(text="Stop")
         self.show("running", [self.stop_btn])
         self.log.configure(state="normal")
@@ -347,10 +362,10 @@ class App:
         self.log.configure(state="disabled")
         self.bar.configure(value=0, maximum=1)
         self.detail.configure(text="")
-        self.context, self.report, self.summary = [], None, {}
+        self.report, self.summary = None, {}
         self.stopping, self.needs_fda = False, False
         self.set_status("Starting…")
-        env = {**os.environ, "VIDEO_CLEANUP_GUI": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        env = {**os.environ, "SIFT_GUI": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         self.proc = subprocess.Popen(
             worker_command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
@@ -368,7 +383,9 @@ class App:
                     kind, data = self.events.get_nowait()
                     if kind == "line":
                         self.handle_line(data)
-                    else:
+                    elif kind == "review":
+                        self.handle_review_line(data)
+                    elif kind == "exit":
                         self.finished(data)
             except queue.Empty:
                 pass
@@ -387,7 +404,6 @@ class App:
         if not text:
             return
         self.append_log(text if not line.startswith(" ") else "  " + text)
-        self.context = (self.context + [text])[-8:]
         if text.startswith("Report: "):
             self.report = text[len("Report: "):]
         if not line.startswith(" "):           # top-level lines are the stages
@@ -416,13 +432,13 @@ class App:
                 text += " · " + eta(spent * (n - i) / i)
             self.detail.configure(text=text)
         elif kind == "ask":
+            # just the question's own explanation: the scan's log is under Show details
+            detail = msg.get("detail")
             self.answer(self.ask(msg.get("question", ""), msg.get("buttons", ["OK"]), msg.get("default"),
-                                 self.context, msg.get("details") or None))
-            self.context = []
+                                 [detail] if detail else None, msg.get("details") or None))
         elif kind == "choose":
             answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)),
                                  msg.get("noun", "video"), bool(msg.get("largest")))
-            self.context = []
             if answer == "cancel":
                 self.stopping = True
             self.answer(answer)
@@ -433,15 +449,50 @@ class App:
         elif kind == "automation":
             self.ask_for_automation()
 
+    # ---- the review page: served by a second process, so it keeps going after the scan
+    def start_review(self, folder: str) -> None:
+        self.stop_review()
+        env = {**os.environ, "SIFT_GUI": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        self.review_proc = proc = subprocess.Popen(
+            worker_command("--review", folder), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+
+        def read() -> None:
+            for line in proc.stdout:
+                self.events.put(("review", line.rstrip("\n")))
+        threading.Thread(target=read, daemon=True).start()
+
+    def handle_review_line(self, line: str) -> None:
+        if line.startswith("@@"):
+            try:
+                msg = json.loads(line[2:])
+            except ValueError:
+                return
+            if msg.get("kind") == "review":
+                self.review_url = msg.get("url", "")
+        elif line.strip():
+            self.append_log(line.strip())
+
+    def open_review(self) -> None:
+        if self.review_proc and self.review_proc.poll() is None and self.review_url:
+            webbrowser.open(self.review_url)
+        elif self.summary.get("folder"):
+            self.start_review(self.summary["folder"])      # it opens the page when it's ready
+
+    def stop_review(self) -> None:
+        if self.review_proc and self.review_proc.poll() is None:
+            self.review_proc.terminate()
+        self.review_proc, self.review_url = None, ""
+
     def finished(self, code: int) -> None:
         self.proc = None
         self.start_btn.configure(text="Scan again")
         if self.report:
             self.show_results()
         elif self.needs_fda:
-            self.show_problem("Video Cleanup needs Full Disk Access",
+            self.show_problem("Sift needs Full Disk Access",
                               "It needs it to read your Photos library. Follow the steps in the window "
-                              "that opened, then quit Video Cleanup and open it again.")
+                              "that opened, then quit Sift and open it again.")
             self.ask_for_fda()
         elif self.stopping:
             self.show_problem("Stopped", "Nothing was deleted. You can start again at any time.")
@@ -468,15 +519,24 @@ class App:
         else:
             self.done_big.configure(text=f"No duplicate {noun}s found")
             self.done_line.configure(text=f"Checked {s.get('scanned', 0):,} {noun}s.")
-        more = ["The report has opened in your browser. Nothing was deleted."]
+        if sets and s.get("folder"):
+            self.start_review(s["folder"])
+            more = [f"The review page has opened in your browser: go through the sets there and mark what "
+                    f"to delete. Marked {noun}s go to the album “Sift - To Delete” in Photos, where you "
+                    "delete them yourself. Nothing has been deleted."]
+        else:
+            self.open_report()
+            more = ["The report has opened in your browser. Nothing was deleted."]
         if s.get("compressed"):
             more.append(f"{s['compressed']:,} smaller copies were made.")
         if s.get("album"):
             more.append(f"They're also in the album “{s['album']}” in Photos, "
                         "where you can check and delete them on your Mac or iPhone.")
         self.done_more.configure(text=" ".join(more))
-        buttons = [self.report_btn] + ([self.photos_btn] if s.get("album") else []) + [self.start_btn]
-        self.start_btn.configure(default="normal")    # Open report is the main button here
+        main = [self.review_btn] if sets and s.get("folder") else []
+        buttons = main + [self.report_btn] + ([self.photos_btn] if s.get("album") else []) + [self.start_btn]
+        self.report_btn.configure(default="normal" if main else "active")
+        self.start_btn.configure(default="normal")
         self.show("done", buttons)
 
     def show_problem(self, head: str, text: str) -> None:
@@ -503,6 +563,7 @@ class App:
                         "Keep scanning") != "Quit":
                 return
             self.proc.kill()
+        self.stop_review()
         self.root.destroy()
 
     # ---- pieces of the window
@@ -740,7 +801,7 @@ class App:
         else:                                  # run from the code: macOS asks on Terminal's behalf
             who, reset = "Terminal (or Visual Studio Code)", "tccutil reset AppleEvents com.apple.Terminal"
         steps = [
-            "macOS isn't letting Video Cleanup control Photos, so it can't make albums, "
+            "macOS isn't letting Sift control Photos, so it can't make albums, "
             "download videos from iCloud or import the smaller copies. The scan carries on without them.",
             "",
             "1. Click Open Settings.",
@@ -757,12 +818,12 @@ class App:
 
     def ask_for_fda(self) -> None:
         steps = [
-            "To read your Photos library, Video Cleanup needs Full Disk Access. You only do this once.",
+            "To read your Photos library, Sift needs Full Disk Access. You only do this once.",
             "",
             "1. Click Open Settings.",
-            "2. Turn on Video Cleanup in the list. If it isn't there, click +, "
-            "choose Video Cleanup from Applications and turn it on.",
-            "3. Quit Video Cleanup and open it again.",
+            "2. Turn on Sift in the list. If it isn't there, click +, "
+            "choose Sift from Applications and turn it on.",
+            "3. Quit Sift and open it again.",
         ]
         if self.ask("Open Full Disk Access settings?", ["Not now", "Open Settings"],
                     "Open Settings", steps) == "Open Settings":
