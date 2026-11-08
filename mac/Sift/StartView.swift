@@ -13,11 +13,56 @@ struct StartView: View {
                     .frame(width: 72, height: 72)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Sift").font(.largeTitle.bold())
-                    Text("Finds duplicate photos and similar shots in your Photos library. "
+                    Text("Finds duplicate photos and similar shots, and makes bulky videos smaller. "
                          + "Nothing is deleted unless you choose to.")
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Picker("What would you like to do?", selection: $model.job) {
+                Text("Find Duplicate Photos").tag(AppModel.Job.photos)
+                Text("Make Videos Smaller").tag(AppModel.Job.videos)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 420)
+
+            if model.job == .photos {
+                photoOptions
+            } else {
+                GroupBox {
+                    Text("Sift finds videos stored in older, bulkier formats or at higher bitrates than they need, "
+                         + "and makes smaller HEVC copies of the ones you choose, keeping each video's date, place, "
+                         + "camera and lens. The copies go into Photos next to the originals, so you can compare "
+                         + "them before deleting the originals. Your originals are never changed.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                } label: {
+                    Text("Making videos smaller").font(.headline)
+                }
+            }
+
+            Spacer(minLength: 0)
+            HStack {
+                Text(model.job == .photos ? "Finding duplicate videos is coming in a later version." : "")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(model.job == .photos ? "Scan Photos" : "Find Videos to Shrink") { model.startJob() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.job == .photos && !model.canScan)
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: 760, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder private var photoOptions: some View {
 
             GroupBox {
                 VStack(alignment: .leading, spacing: 10) {
@@ -56,23 +101,6 @@ struct StartView: View {
             } label: {
                 Text("How strict").font(.headline)
             }
-
-            Spacer(minLength: 0)
-            HStack {
-                Text("Videos are coming in a later version.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Scan Photos") { model.scan() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!model.canScan)
-            }
-        }
-        .padding(28)
-        .frame(maxWidth: 760, maxHeight: .infinity, alignment: .topLeading)
-        .frame(maxWidth: .infinity)
     }
 }
 

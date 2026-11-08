@@ -142,3 +142,53 @@ final class FormatTests: XCTestCase {
         XCTAssertEqual(Format.timeLeft(spent: 40, done: 2400, total: 8000), "about 2 minutes left")
     }
 }
+
+final class CompressionTests: XCTestCase {
+    func video(_ w: Int, _ h: Int, mb: Double, seconds: Double, fps: Double = 0) -> VideoItem {
+        VideoItem(id: "v", name: "v.mov", date: nil, width: w, height: h, size: Int64(mb * 1_000_000), duration: seconds, fps: fps)
+    }
+
+    func testTargetBitrates() {
+        XCTAssertEqual(Compression.targetKbps(shortSide: 1080, fps: 30), 8000)
+        XCTAssertEqual(Compression.targetKbps(shortSide: 1080, fps: 60), 12000)
+        XCTAssertEqual(Compression.targetKbps(shortSide: 2160, fps: 0), 23000, "unknown frame rate counts as 30")
+        XCTAssertEqual(Compression.targetKbps(shortSide: 480, fps: 25), 2500)
+    }
+
+    func testOldBulkyVideoIsWorthShrinking() throws {
+        // a 1080p H.264 video at about 20 Mbit/s: 150 MB a minute
+        let v = video(1920, 1080, mb: 300, seconds: 120)
+        let plan = try XCTUnwrap(Compression.plan(v, mode: .sameResolution))
+        XCTAssertEqual(plan.kbps, 8000)
+        XCTAssertEqual(plan.estimatedSize, 123_840_000)          // (8000 + 256) kbit/s × 120 s
+        XCTAssertEqual(plan.saving(v), 176_160_000)
+        XCTAssertEqual(plan.label, "HEVC at a standard bitrate")
+    }
+
+    func testCappingA4KVideo() throws {
+        let v = video(3840, 2160, mb: 700, seconds: 120)          // about 47 Mbit/s
+        XCTAssertNotNil(Compression.plan(v, mode: .sameResolution))
+        let hd = try XCTUnwrap(Compression.plan(v, mode: .cap1080p))
+        XCTAssertEqual(hd.shortSide, 1080)
+        XCTAssertEqual(hd.label, "4K → 1080p HEVC")
+        XCTAssertGreaterThan(hd.saving(v), Compression.plan(v, mode: .sameResolution)!.saving(v))
+    }
+
+    func testEfficientOrSpecialVideosAreLeftAlone() {
+        XCTAssertNil(Compression.plan(video(1920, 1080, mb: 70, seconds: 60), mode: .sameResolution), "already about iPhone HEVC size")
+        XCTAssertNil(Compression.plan(video(1920, 1080, mb: 18, seconds: 6), mode: .sameResolution), "bulky, but would save under 15 MB")
+        var slow = video(1920, 1080, mb: 300, seconds: 120); slow.slowMo = true
+        XCTAssertNil(Compression.plan(slow, mode: .sameResolution))
+        var edited = video(1920, 1080, mb: 300, seconds: 120); edited.edited = true
+        XCTAssertNil(Compression.plan(edited, mode: .sameResolution))
+        XCTAssertNil(Compression.plan(video(1920, 1080, mb: 300, seconds: 120, fps: 120), mode: .sameResolution), "high frame rate")
+    }
+
+    func testOutputSizeStaysEvenAndKeepsShape() {
+        XCTAssertTrue(Compression.outputSize(width: 3840, height: 2160, shortSide: 1080) == (1920, 1080))
+        XCTAssertTrue(Compression.outputSize(width: 2160, height: 3840, shortSide: 1080) == (1080, 1920), "portrait")
+        XCTAssertTrue(Compression.outputSize(width: 1920, height: 1080, shortSide: 1080) == (1920, 1080), "no change")
+        let odd = Compression.outputSize(width: 1281, height: 721, shortSide: 541)
+        XCTAssertEqual(odd.width % 2, 0); XCTAssertEqual(odd.height % 2, 0)
+    }
+}

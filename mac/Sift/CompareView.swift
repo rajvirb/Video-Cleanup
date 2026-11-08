@@ -37,7 +37,7 @@ struct CompareView: View {
                         .keyboardShortcut(.rightArrow, modifiers: [])
                         .disabled(k >= model.sets.count - 1)
                     Button(role: .destructive) {
-                        Task { await model.delete(Set(markedHere)) }
+                        model.requestDelete(Set(markedHere))
                     } label: {
                         Text(markedHere.isEmpty ? "Delete" : "Delete \(markedHere.count)")
                     }
@@ -53,6 +53,10 @@ struct CompareView: View {
             .focusable()
             .focused($focused)
             .onAppear { focused = true }
+            // the summary before deleting opens from here while the compare view is showing
+            .sheet(item: Binding(get: { model.pendingDelete }, set: { model.pendingDelete = $0 })) { pending in
+                DeleteSummaryView(pending: pending).environmentObject(model)
+            }
             .onChange(of: k) { zoom = 1 }
             .onKeyPress(characters: .decimalDigits) { press in
                 guard let n = Int(press.characters), n >= 1, n <= set.members.count else { return .ignored }

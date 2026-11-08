@@ -6,7 +6,8 @@ import SwiftUI
 /// What the window is showing, and everything the screens share.
 @MainActor
 final class AppModel: ObservableObject {
-    enum Stage { case welcome, noAccess, start, scanning, results }
+    enum Stage { case welcome, noAccess, start, scanning, results, videos, compressing, compressed }
+    enum Job: Hashable { case photos, videos }
     enum Scope: Hashable { case everything, albums }
     enum SortOrder: String, CaseIterable, Identifiable {
         case space = "Most space saved first", count = "Largest sets first"
@@ -17,6 +18,7 @@ final class AppModel: ObservableObject {
     let library = PhotoLibrary()
 
     @Published var stage: Stage = .welcome
+    @Published var job: Job = .photos
     // what to scan
     @Published var totalPhotos = 0
     @Published var albums: [AlbumNode] = []
@@ -39,6 +41,21 @@ final class AppModel: ObservableObject {
     @Published var message: String?           // a note at the top of the results, after deleting
     @Published var comparing: Int?            // the set open in the compare view
     @Published var deleting = false
+    // Sift's own summary, shown before macOS's confirmation whenever something is to be deleted
+    @Published var pendingDelete: PendingDelete?
+    // videos to make smaller
+    @Published var candidates: [VideoCandidate] = []
+    @Published var compressionMode: CompressionMode = .sameResolution
+    @Published var chosenVideos: Set<String> = []
+    @Published var compressName = ""
+    @Published var compressIndex = 0
+    @Published var compressTotal = 0
+    @Published var compressFraction = 0.0
+    @Published var compressDetail = ""
+    @Published var compressResults: [CompressResult] = []
+    @Published var originalsDeleted = false
+    private var compressor: VideoCompressor?
+    private var compressStarted = Date()
 
     // MARK: getting started
 
@@ -105,6 +122,10 @@ final class AppModel: ObservableObject {
         stage = .start
     }
 
+    func startJob() {
+        if job == .photos { scan() } else { findVideos() }
+    }
+
     private func step(_ title: String) {
         stepTitle = title
         stepDone = 0
@@ -166,8 +187,27 @@ final class AppModel: ObservableObject {
         sets.filter { set in set.members.allSatisfy { ids.contains(items[$0.index].id) } }.count
     }
 
+    /// Shows Sift's summary of what's about to be deleted. Nothing happens until the person
+    /// confirms it, and then macOS asks them to confirm as well.
+    func requestDelete(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        let entries = items.filter { ids.contains($0.id) }.map {
+            DeleteEntry(id: $0.id, name: $0.name, size: $0.size, favorite: $0.favorite, edited: $0.edited,
+                        live: $0.live, raw: $0.raw, isVideo: false)
+        }
+        pendingDelete = PendingDelete(kind: .photos, entries: entries, nothingKept: setsWithNothingKept(ids))
+    }
+
+    func confirmDelete(_ pending: PendingDelete) async {
+        pendingDelete = nil
+        switch pending.kind {
+        case .photos: await delete(Set(pending.entries.map(\.id)))
+        case .videoOriginals: await deleteOriginals(Set(pending.entries.map(\.id)))
+        }
+    }
+
     /// Deletes photos (macOS asks to confirm), then takes them out of the results.
-    func delete(_ ids: Set<String>) async {
+    private func delete(_ ids: Set<String>) async {
         guard !ids.isEmpty else { return }
         deleting = true
         defer { deleting = false }
@@ -181,6 +221,120 @@ final class AppModel: ObservableObject {
         if let open = comparing, open >= sets.count { comparing = sets.isEmpty ? nil : sets.count - 1 }
         message = "Deleted \(Format.plural(ids.count, "photo")) (\(Format.size(size))). They're in Recently Deleted "
             + "in Photos for 30 days. To free the space now, empty Recently Deleted."
+    }
+
+    // MARK: videos
+
+    /// Finds the videos a smaller copy is worth making of.
+    func findVideos() {
+        stage = .scanning
+        message = nil
+        originalsDeleted = false
+        let library = self.library
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Reading your videos…")
+            let videos = library.videos { done, total in
+                Task { @MainActor in self?.progress(done, total, "Reading") }
+            }
+            let candidates = videos.compactMap { video -> VideoCandidate? in
+                let same = Compression.plan(video, mode: .sameResolution)
+                let hd = Compression.plan(video, mode: .cap1080p)
+                return same == nil && hd == nil ? nil : VideoCandidate(video: video, same: same, hd: hd)
+            }
+            .sorted { ($0.same ?? $0.hd!).saving($0.video) > ($1.same ?? $1.hd!).saving($1.video) }
+            if Task.isCancelled { return }
+            await self?.showCandidates(candidates)
+        }
+    }
+
+    private func showCandidates(_ found: [VideoCandidate]) {
+        candidates = found
+        chosenVideos = Set(found.filter { $0.plan(compressionMode) != nil }.map(\.id))
+        stage = .videos
+    }
+
+    /// The videos that will be made smaller at the chosen setting.
+    var videosToCompress: [VideoCandidate] {
+        candidates.filter { chosenVideos.contains($0.id) && $0.plan(compressionMode) != nil }
+    }
+
+    var compressionSaving: Int64 {
+        videosToCompress.reduce(0) { $0 + ($1.plan(compressionMode)?.saving($1.video) ?? 0) }
+    }
+
+    func compressVideos() {
+        let todo = videosToCompress
+        guard !todo.isEmpty else { return }
+        stage = .compressing
+        compressResults = []
+        compressTotal = todo.count
+        compressStarted = Date()
+        let mode = compressionMode
+        let compressor = VideoCompressor()
+        self.compressor = compressor
+        scanTask = Task { [weak self] in
+            for (k, candidate) in todo.enumerated() {
+                guard let self, !Task.isCancelled else { break }
+                self.compressIndex = k + 1
+                self.compressName = candidate.video.name
+                self.compressFraction = 0
+                do {
+                    let (newID, size) = try await compressor.compress(candidate.id, mode: mode) { value in
+                        Task { @MainActor [weak self] in self?.updateCompressProgress(k, of: todo.count, value) }
+                    }
+                    self.compressResults.append(CompressResult(video: candidate.video, newID: newID, newSize: size, problem: nil))
+                } catch is CancellationError {
+                    break
+                } catch {
+                    self.compressResults.append(CompressResult(video: candidate.video, newID: nil, newSize: nil,
+                                                               problem: error.localizedDescription))
+                }
+            }
+            self?.stage = .compressed
+        }
+    }
+
+    private func updateCompressProgress(_ k: Int, of total: Int, _ value: Double) {
+        compressFraction = value
+        let overall = (Double(k) + value) / Double(total)
+        var detail = "\(compressIndex) of \(total)"
+        if let left = Format.timeLeft(spent: Date().timeIntervalSince(compressStarted), done: Int(overall * 1000), total: 1000) {
+            detail += " · \(left)"
+        }
+        compressDetail = detail
+    }
+
+    func cancelCompressing() {
+        compressor?.cancel()
+        scanTask?.cancel()
+    }
+
+    var compressedOK: [CompressResult] { compressResults.filter { $0.newID != nil } }
+    var compressedSaving: Int64 { compressedOK.reduce(0) { $0 + max(0, $1.video.size - ($1.newSize ?? 0)) } }
+
+    /// Shows the summary before deleting the originals of the videos that now have a smaller copy.
+    func requestDeleteOriginals() {
+        let entries = compressedOK.map {
+            DeleteEntry(id: $0.video.id, name: $0.video.name, size: $0.video.size, favorite: $0.video.favorite,
+                        edited: false, live: false, raw: false, isVideo: true)
+        }
+        guard !entries.isEmpty else { return }
+        pendingDelete = PendingDelete(kind: .videoOriginals, entries: entries, nothingKept: 0)
+    }
+
+    private func deleteOriginals(_ ids: Set<String>) async {
+        deleting = true
+        defer { deleting = false }
+        guard await library.delete(Array(ids)) else { return }
+        originalsDeleted = true
+        message = "Deleted \(Format.plural(ids.count, "original")). They're in Recently Deleted in Photos for 30 days. "
+            + "To free the space now, empty Recently Deleted."
+    }
+
+    func openPhotos() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Photos") {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
     }
 
     private func sortSets() {
@@ -199,4 +353,40 @@ final class AppModel: ObservableObject {
     func openPrivacySettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos")!)
     }
+}
+
+struct VideoCandidate: Identifiable, Hashable {
+    let video: VideoItem
+    let same: CompressionPlan?
+    let hd: CompressionPlan?
+    var id: String { video.id }
+    func plan(_ mode: CompressionMode) -> CompressionPlan? { mode == .sameResolution ? same : hd }
+}
+
+struct CompressResult: Identifiable, Hashable {
+    let video: VideoItem
+    let newID: String?
+    let newSize: Int64?
+    let problem: String?
+    var id: String { video.id }
+}
+
+/// What's about to be deleted, for Sift's summary.
+struct PendingDelete: Identifiable {
+    enum Kind { case photos, videoOriginals }
+    let id = UUID()
+    let kind: Kind
+    let entries: [DeleteEntry]
+    let nothingKept: Int          // sets in which every photo is marked
+}
+
+struct DeleteEntry: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let size: Int64
+    let favorite: Bool
+    let edited: Bool
+    let live: Bool
+    let raw: Bool
+    let isVideo: Bool
 }

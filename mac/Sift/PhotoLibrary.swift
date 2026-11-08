@@ -243,10 +243,52 @@ final class PhotoLibrary: @unchecked Sendable {
         manager.cancelImageRequest(request)
     }
 
+    // MARK: videos
+
+    /// Every video in the library, with what's needed to decide whether a smaller copy is
+    /// worth making. (The frame rate is only known once a file is opened, so it's left out.)
+    func videos(progress: @escaping (Int, Int) -> Void) -> [VideoItem] {
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+        options.includeAssetSourceTypes = [.typeUserLibrary]
+        var list: [PHAsset] = []
+        PHAsset.fetchAssets(with: options).enumerateObjects { asset, _, _ in list.append(asset) }
+        var items = [VideoItem?](repeating: nil, count: list.count)
+        let lock = NSLock()
+        var done = 0
+        DispatchQueue.concurrentPerform(iterations: list.count) { i in
+            let asset = list[i]
+            let resources = PHAssetResource.assetResources(for: asset)
+            let original = resources.first { $0.type == .video } ?? resources.first
+            let size = (original?.value(forKey: "fileSize") as? Int64)
+                ?? (original?.value(forKey: "fileSize") as? Int).map(Int64.init) ?? 0
+            let item = VideoItem(
+                id: asset.localIdentifier,
+                name: original?.originalFilename ?? "Video",
+                date: asset.creationDate,
+                width: asset.pixelWidth,
+                height: asset.pixelHeight,
+                size: size,
+                duration: asset.duration,
+                favorite: asset.isFavorite,
+                slowMo: asset.mediaSubtypes.contains(.videoHighFrameRate),
+                timeLapse: asset.mediaSubtypes.contains(.videoTimelapse),
+                edited: resources.contains { $0.type == .fullSizeVideo || $0.type == .adjustmentData }
+            )
+            lock.lock()
+            items[i] = item
+            done += 1
+            let finished = done
+            lock.unlock()
+            if finished % 50 == 0 || finished == list.count { progress(finished, list.count) }
+        }
+        return items.compactMap { $0 }
+    }
+
     // MARK: deleting
 
-    /// Deletes photos. macOS asks the person to confirm first; deleted photos go to Recently
-    /// Deleted for 30 days. Returns false if they cancelled or it failed.
+    /// Deletes photos or videos. macOS asks the person to confirm first; deleted items go to
+    /// Recently Deleted for 30 days. Returns false if they cancelled or it failed.
     func delete(_ ids: [String]) async -> Bool {
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
         guard assets.count > 0 else { return false }

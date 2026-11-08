@@ -6,7 +6,6 @@ import SwiftUI
 /// KEEP or DELETE.
 struct ResultsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var confirmNothingKept = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,20 +42,13 @@ struct ResultsView: View {
                 Button("Clear") { model.marked.removeAll() }
                     .disabled(model.marked.isEmpty)
                 Button(role: .destructive) {
-                    if model.setsWithNothingKept(model.marked) > 0 { confirmNothingKept = true }
-                    else { Task { await model.delete(model.marked) } }
+                    model.requestDelete(model.marked)
                 } label: {
                     Text(model.marked.isEmpty ? "Delete" : "Delete \(model.marked.count.formatted())")
                 }
                 .disabled(model.marked.isEmpty || model.deleting)
                 Button("Scan Again") { model.stage = .start }
             }
-        }
-        .alert("Nothing would be kept in some sets", isPresented: $confirmNothingKept) {
-            Button("Delete Anyway", role: .destructive) { Task { await model.delete(model.marked) } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("In \(Format.plural(model.setsWithNothingKept(model.marked), "set")) every photo is marked, so none of them would be kept.")
         }
         .sheet(isPresented: Binding(get: { model.comparing != nil }, set: { if !$0 { model.comparing = nil } })) {
             CompareView()

@@ -37,6 +37,19 @@ struct ContentView: View {
             ScanningView()
         case .results:
             ResultsView()
+                .sheet(item: Binding(get: { model.comparing == nil ? model.pendingDelete : nil },
+                                     set: { model.pendingDelete = $0 })) { pending in
+                    DeleteSummaryView(pending: pending).environmentObject(model)
+                }
+        case .videos:
+            VideosView()
+        case .compressing:
+            CompressingView()
+        case .compressed:
+            CompressedView()
+                .sheet(item: $model.pendingDelete) { pending in
+                    DeleteSummaryView(pending: pending).environmentObject(model)
+                }
         }
     }
 }
