@@ -1920,9 +1920,12 @@ def ask_choice(question: str, options: tuple[str, ...], default: str,
             return ans
 
 
-def ask(question: str, default: bool = False) -> bool:
+def ask(question: str, default: bool = False, detail: str = "") -> bool:
+    """A yes/no question. detail is a line or two the app shows under it (in Terminal,
+    what's been printed above the question says the same)."""
     if GUI:
-        gui_send("ask", question=question, buttons=["No", "Yes"], default="Yes" if default else "No")
+        gui_send("ask", question=question, buttons=["No", "Yes"], default="Yes" if default else "No",
+                 detail=detail)
         ans = sys.stdin.readline().strip()
         return default if not ans else ans == "Yes"
     if not sys.stdin.isatty():
@@ -1997,15 +2000,16 @@ def clean_up_photos(photos: list[Video], source: str, level: str, args, ff: str,
     saving = sum(g.saving(photos) for g in groups)
     n_delete = sum(1 for g in groups for a, _ in g.action.values() if a == "delete")
     n_review = sum(1 for g in groups for a, _ in g.action.values() if a == "review")
-    print(f"\nFound {len(groups)} sets of duplicate or similar photos. Deleting {n_delete} suggested "
-          f"copies would free {human_size(saving)}, and {n_review} more are worth a look.")
+    print(f"\nFound {len(groups):,} sets of duplicate or similar photos: {n_delete:,} copies to delete "
+          f"({human_size(saving)}) and {n_review:,} similar photos to check.")
 
     albums_made = False
     if groups:
         want = args.make_albums
         if want is None:
-            want = ask("Create an album in Photos with these duplicate and similar photos, "
-                       "so you can check and delete them on your iPhone?", True)
+            want = ask("Add them to an album in Photos?", True,
+                       f"{len(groups):,} sets found: {n_delete:,} copies to delete ({human_size(saving)}) and "
+                       f"{n_review:,} similar photos to check. An album lets you check them on your iPhone too.")
         if want:
             print("Adding the album in Photos (Photos will open; allow "
                   f"{'Sift' if GUI else 'Terminal'} to control it if asked)…")
@@ -2110,7 +2114,10 @@ def main() -> None:
         print(f"\n{len(cloud)} of them ({human_size(sum(v.size for v in cloud))}) are only in iCloud, not on this Mac.")
         print("They'll still be checked for exact and re-saved copies using their previews.")
         print("For a full check (including trimmed copies) they need downloading, which can take a long time.")
-        download = ask("Download them temporarily for a full check?", False)
+        download = ask("Download the videos that are only in iCloud?", False,
+                       f"{len(cloud):,} videos ({human_size(sum(v.size for v in cloud))}) are only in iCloud. "
+                       "They're still checked for copies without downloading, but not for trimmed clips. "
+                       "Downloading can take a long time.")
 
 
     if download and not can_control_photos():
@@ -2122,15 +2129,18 @@ def main() -> None:
     groups = build_groups(videos, edges)
     saving = sum(g.saving(videos) for g in groups)
     n_delete = sum(1 for g in groups for a, _ in g.action.values() if a == "delete")
-    print(f"\nFound {len(groups)} sets of duplicates. "
-          f"Deleting {n_delete} suggested copies would free {human_size(saving)}.")
+    n_review = sum(1 for g in groups for a, _ in g.action.values() if a == "review")
+    print(f"\nFound {len(groups):,} sets of duplicates: {n_delete:,} copies to delete ({human_size(saving)})"
+          + (f" and {n_review:,} look-alikes to check." if n_review else "."))
 
     albums_made = False
     if use_photos and groups:
         want = args.make_albums
         if want is None:
-            want = ask("Create an album in Photos with these duplicate and trimmed videos, "
-                       "so you can check and delete them on your iPhone?", True)
+            want = ask("Add them to an album in Photos?", True,
+                       f"{len(groups):,} sets found: {n_delete:,} copies to delete ({human_size(saving)})"
+                       + (f" and {n_review:,} look-alikes to check" if n_review else "")
+                       + ". An album lets you check them on your iPhone too.")
         if want:
             print("Adding albums in Photos (Photos will open; allow "
                   f"{'Sift' if GUI else 'Terminal'} to control it if asked)…")
@@ -2190,8 +2200,9 @@ def main() -> None:
             if done and use_photos:
                 want = args.do_import
                 if want is None:
-                    want = ask("Import the smaller copies into Photos, with the same dates, places, "
-                               "favourites and albums?", True)
+                    want = ask("Import the smaller copies into Photos?", True,
+                               "Each one gets its original's date, place, favourite and albums. "
+                               "Your originals aren't changed.")
                 if want and can_control_photos():
                     try:
                         imported = import_copies(videos, done)
@@ -2217,7 +2228,7 @@ def main() -> None:
                        cands, comp_result)
     if GUI:
         gui_send("summary", noun="video", scanned=len(videos), sets=len(groups), delete=n_delete,
-                 review=sum(1 for g in groups for a, _ in g.action.values() if a == "review"),
+                 review=n_review,
                  saving=human_size(saving), album=ALBUM_DUPES if albums_made else "",
                  compressed=comp_result["done"] if comp_result else 0, folder=str(out_dir))
     finish(out, groups, args, t0)

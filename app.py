@@ -239,7 +239,6 @@ class App:
 
         self.proc: subprocess.Popen | None = None
         self.events: queue.Queue = queue.Queue()
-        self.context: list[str] = []     # recent lines, shown above each question
         self.report: str | None = None
         self.summary: dict = {}
         self.stopping = False
@@ -363,7 +362,7 @@ class App:
         self.log.configure(state="disabled")
         self.bar.configure(value=0, maximum=1)
         self.detail.configure(text="")
-        self.context, self.report, self.summary = [], None, {}
+        self.report, self.summary = None, {}
         self.stopping, self.needs_fda = False, False
         self.set_status("Starting…")
         env = {**os.environ, "SIFT_GUI": "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
@@ -405,7 +404,6 @@ class App:
         if not text:
             return
         self.append_log(text if not line.startswith(" ") else "  " + text)
-        self.context = (self.context + [text])[-8:]
         if text.startswith("Report: "):
             self.report = text[len("Report: "):]
         if not line.startswith(" "):           # top-level lines are the stages
@@ -434,13 +432,13 @@ class App:
                 text += " · " + eta(spent * (n - i) / i)
             self.detail.configure(text=text)
         elif kind == "ask":
+            # just the question's own explanation: the scan's log is under Show details
+            detail = msg.get("detail")
             self.answer(self.ask(msg.get("question", ""), msg.get("buttons", ["OK"]), msg.get("default"),
-                                 self.context, msg.get("details") or None))
-            self.context = []
+                                 [detail] if detail else None, msg.get("details") or None))
         elif kind == "choose":
             answer = self.choose(msg.get("question", ""), msg.get("items", []), int(msg.get("total", 0)),
                                  msg.get("noun", "video"), bool(msg.get("largest")))
-            self.context = []
             if answer == "cancel":
                 self.stopping = True
             self.answer(answer)
