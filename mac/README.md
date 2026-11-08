@@ -2,10 +2,21 @@
 
 The native version of Sift, written in Swift with SwiftUI, for the Mac App Store. It uses
 Apple's Photos framework (PhotoKit), so it asks for access to your photos the normal way.
-It doesn't need Full Disk Access, AppleScript or Terminal, and it can delete photos directly
-(macOS asks you to confirm, and they go to Recently Deleted).
+It doesn't need Full Disk Access, AppleScript or Terminal.
 
-This first version finds **duplicate photos and similar shots**. Videos and compression come next.
+It does two things so far:
+
+- **Find Duplicate Photos:** copies and similar shots, to review, compare side by side in full
+  quality, and delete.
+- **Make Videos Smaller:** finds videos stored in older, bulkier formats and makes smaller
+  HEVC copies of the ones you choose. Each copy keeps its date, place, camera and lens, and goes
+  into Photos with the original's favourite status and albums, so you can compare them before
+  deleting the originals.
+
+**Nothing is ever deleted without asking you twice.** First Sift shows its own summary of
+exactly what will be deleted: how many, how much space, favourites, edited photos, Live Photos,
+and sets where nothing would be kept. Then macOS itself asks you to confirm. Deleted items stay
+in Photos' **Recently Deleted** album for 30 days.
 
 ## Running it on your Mac
 
@@ -57,7 +68,10 @@ If you change the team, `./mac/open.sh` will reset it, because the project is re
 - `Sift/PhotoLibrary.swift` talks to Photos: permission, photo details, albums and folders,
   thumbnails, full-quality images (downloading from iCloud when needed), and deleting.
 - `Sift/AppModel.swift` holds the app's state and runs the scan.
-- `Sift/*View.swift` are the screens: what to scan, progress, the results, and the compare view.
+- `Sift/VideoCompressor.swift` makes the smaller video copies with AVFoundation (the Mac's
+  hardware HEVC encoder) and saves them to Photos.
+- `Sift/*View.swift` are the screens: what to do, progress, the results, the compare view, the
+  videos to shrink, and the summary before deleting.
 - `project.yml` describes the Xcode project. `Sift.xcodeproj` is made from it and isn't kept in git.
 
 GitHub builds the app and runs the tests on every push (the **Native app** job under
@@ -65,10 +79,10 @@ GitHub builds the app and runs the tests on every push (the **Native app** job u
 
 ## The road to the App Store
 
-1. **Photos** (this version): duplicates and similar shots, review, compare, delete.
-2. **Videos:** duplicates and trimmed copies, using AVFoundation to read frames.
-3. **Making videos smaller:** AVFoundation's hardware HEVC export, saved back to Photos with
-   each video's date, place, camera and lens.
+1. **Photos** (done): duplicates and similar shots, review, compare, delete.
+2. **Making videos smaller** (done): hardware HEVC copies saved back to Photos with each video's
+   date, place, camera and lens.
+3. **Duplicate videos:** copies and trimmed clips, using AVFoundation to read frames.
 4. **App Store preparation**, which needs the **Apple Developer Program** ($99 a year):
    - your team in `project.yml`, and an App Store Connect record for Sift;
    - a privacy manifest (Sift collects no data) and the App Privacy answers;
