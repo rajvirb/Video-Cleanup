@@ -1,0 +1,40 @@
+{
+  "identifier" : "5A1F7C2E-SIFT-TIPS",
+  "nonRenewingSubscriptions" : [],
+  "products" : [
+    {
+      "displayPrice" : "1.99",
+      "familyShareable" : false,
+      "internalID" : "6740000001",
+      "localizations" : [ { "description" : "A small thank-you for Sift", "displayName" : "Small tip", "locale" : "en_GB" } ],
+      "productID" : "com.rajvirb.siftapp.tip.small",
+      "referenceName" : "Small tip",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "6740000002",
+      "localizations" : [ { "description" : "A thank-you for Sift", "displayName" : "Kind tip", "locale" : "en_GB" } ],
+      "productID" : "com.rajvirb.siftapp.tip.medium",
+      "referenceName" : "Kind tip",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "9.99",
+      "familyShareable" : false,
+      "internalID" : "6740000003",
+      "localizations" : [ { "description" : "A generous thank-you for Sift", "displayName" : "Generous tip", "locale" : "en_GB" } ],
+      "productID" : "com.rajvirb.siftapp.tip.large",
+      "referenceName" : "Generous tip",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_locale" : "en_GB",
+    "_storefront" : "GBR",
+    "_storeKitErrors" : []
+  },
+  "subscriptionGroups" : [],
+  "version" : { "major" : 4, "minor" : 0 }
+}

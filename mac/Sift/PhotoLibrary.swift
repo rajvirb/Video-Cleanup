@@ -256,20 +256,7 @@ final class PhotoLibrary: @unchecked Sendable {
             }
         }
         guard let video else { return [] }
-        let generator = AVAssetImageGenerator(asset: video)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 96, height: 96)
-        let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
-        let times = VideoMatcher.frameTimes(duration: asset.duration).map { CMTime(seconds: $0, preferredTimescale: 600) }
-        var hashes: [UInt64] = []
-        for await result in generator.images(for: times) {
-            guard let image = try? result.image, let gray = Self.gray(image, maxSide: 96),
-                  let hash = Fingerprint.frameHash(gray: gray.pixels, width: gray.width, height: gray.height) else { continue }
-            hashes.append(hash)
-        }
-        return hashes
+        return await VideoFrames.hashes(video, duration: asset.duration)
     }
 
     /// Saves a copy of an item's original file into a folder (downloading it from iCloud if
@@ -328,7 +315,7 @@ final class PhotoLibrary: @unchecked Sendable {
     /// A thumbnail to show in a grid. `done` may be called twice: quickly with a rough
     /// version, then with a sharp one. Returns the request, to cancel it.
     @discardableResult
-    func thumbnail(_ id: String, side: CGFloat, done: @escaping (NSImage?) -> Void) -> PHImageRequestID? {
+    func thumbnail(_ id: String, side: CGFloat, _ done: @escaping (NSImage?) -> Void) -> PHImageRequestID? {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
             done(nil); return nil
         }

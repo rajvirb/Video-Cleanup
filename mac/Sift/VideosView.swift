@@ -34,7 +34,7 @@ struct VideosView: View {
                     Text("Slo-mo, time-lapse and edited videos are left out, because re-saving them would lose those effects.")
                         .font(.callout)
                         .foregroundStyle(Theme.muted)
-                    outputOptions
+                    if model.source == .photos { outputOptions }
                 }
             }
             .padding(.horizontal, 24)
@@ -222,13 +222,18 @@ struct CompressedView: View {
                 Text(ok.isEmpty ? "No smaller copies were made"
                      : "Made \(Format.plural(ok.count, "smaller copy", "smaller copies")), saving \(Format.size(model.compressedSaving))")
                     .font(Theme.display(30))
-                if !inPhotos.isEmpty {
+                if !inPhotos.isEmpty && model.source == .photos {
                     Text("They're in Photos with the same dates, places, favourites and albums as the originals. To compare "
                          + "them, open the album “\(VideoCompressor.albumCompare)”, where each original sits next to its copy.")
                         .foregroundStyle(Theme.ink2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if inFolder, let folder = model.lastFolderUsed {
+                if inFolder, model.source == .folders {
+                    Text("Each is saved next to its original, named like “IMG_1234 - sift compression.MOV”, with the same "
+                         + "date and place.")
+                        .foregroundStyle(Theme.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if inFolder, let folder = model.lastFolderUsed {
                     Text("They're also in “\(folder.lastPathComponent)”, each next to a copy of its original, named like "
                          + "“IMG_1234 - sift compression.MOV”.")
                         .foregroundStyle(Theme.ink2)
@@ -271,9 +276,18 @@ struct CompressedView: View {
                 Button("Done") { model.stage = .start }.buttonStyle(.secondary)
                 Spacer()
                 if inFolder {
-                    Button("Show in Finder") { model.openComparisonFolder() }.buttonStyle(.secondary)
+                    Button("Show in Finder") {
+                        if model.source == .folders {
+                            NSWorkspace.shared.activateFileViewerSelecting(ok.compactMap(\.file))
+                        } else {
+                            model.openComparisonFolder()
+                        }
+                    }
+                    .buttonStyle(.secondary)
                 }
-                Button("Open Photos") { model.openPhotos() }.buttonStyle(.secondary)
+                if model.source == .photos {
+                    Button("Open Photos") { model.openPhotos() }.buttonStyle(.secondary)
+                }
                 if !inPhotos.isEmpty && !model.originalsDeleted {
                     Button("Delete \(Format.plural(inPhotos.count, "Original"))…") { model.requestDeleteOriginals() }
                         .buttonStyle(.danger)

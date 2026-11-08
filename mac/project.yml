@@ -6,6 +6,12 @@ options:
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
+# Release is the free GitHub build (with the updatable donate link); AppStore is the Mac
+# App Store build (tips through in-app purchase only, as Apple requires).
+configs:
+  Debug: debug
+  Release: release
+  AppStore: release
 packages:
   SiftCore:
     path: SiftCore
@@ -30,6 +36,9 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.photography
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        # Google sign-in: an OAuth client ID from Google Cloud (see README.md). Blank
+        # leaves Google Photos switched off.
+        GoogleClientID: $(GOOGLE_CLIENT_ID)
         NSPhotoLibraryUsageDescription: >-
           Sift looks through your photos to find duplicates and similar shots, and deletes
           the ones you choose. Nothing leaves your Mac.
@@ -42,6 +51,8 @@ targets:
         # the comparison folder: one the person picks, remembered between launches
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.files.bookmarks.app-scope: true
+        # Google Photos, and the donate link's settings
+        com.apple.security.network.client: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rajvirb.siftapp
@@ -54,3 +65,22 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         DEVELOPMENT_TEAM: ""
         COMBINE_HIDPI_IMAGES: YES
+        GOOGLE_CLIENT_ID: ""
+      configs:
+        AppStore:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: APP_STORE
+schemes:
+  Sift:
+    build:
+      targets:
+        Sift: all
+    run:
+      config: Debug
+      # test tips without App Store Connect
+      storeKitConfiguration: Sift.storekit
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: AppStore

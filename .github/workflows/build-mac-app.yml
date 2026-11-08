@@ -62,6 +62,13 @@ jobs:
           xcodebuild -project Sift.xcodeproj -scheme Sift -configuration Debug -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO build 2>&1 | tee -a ../native.log | grep -E "error|warning: .*Sift/|BUILD" || true
           grep -q "BUILD SUCCEEDED" ../native.log
+      - name: Build the App Store version
+        run: |
+          set -o pipefail
+          cd mac
+          xcodebuild -project Sift.xcodeproj -scheme Sift -configuration AppStore -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee -a ../native.log | grep -E "error|BUILD" || true
+          tail -n 5 ../native.log | grep -q "BUILD SUCCEEDED"
       - name: Show why it failed
         if: failure()
         run: |

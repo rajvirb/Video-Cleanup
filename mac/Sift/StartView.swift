@@ -9,18 +9,15 @@ struct StartView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
                 header
-                HStack(spacing: 14) {
-                    JobCard(job: .photos, symbol: "square.on.square", title: "Find duplicate photos",
-                            detail: "Copies and similar shots, to compare side by side and delete.")
-                    JobCard(job: .videoDuplicates, symbol: "film.stack", title: "Find duplicate videos",
-                            detail: "Copies, re-saved versions and trimmed clips of the same video.")
-                    JobCard(job: .videoCompression, symbol: "arrow.down.right.and.arrow.up.left", title: "Make videos smaller",
-                            detail: "Smaller HEVC copies of bulky videos, with their dates, places and cameras.")
+                switch model.source {
+                case .photos: scopeOptions
+                case .folders: FolderSourceCard()
+                case .google: GoogleSourceCard()
                 }
-                scopeOptions
                 if model.job == .videoCompression { videoOptions } else { strictnessOptions }
                 HStack(alignment: .center) {
-                    Text("Nothing is deleted unless you choose to, and Sift asks you twice first.")
+                    Text(model.source == .google ? "Sift only looks at Google Photos. Deleting happens in Google Photos, by you."
+                         : "Nothing is deleted unless you choose to, and Sift asks you twice first.")
                         .font(.callout)
                         .foregroundStyle(Theme.muted)
                     Spacer()
@@ -40,18 +37,42 @@ struct StartView: View {
         HStack(spacing: 18) {
             Image(nsImage: NSApp.applicationIconImage)
                 .resizable()
-                .frame(width: 68, height: 68)
+                .frame(width: 60, height: 60)
             VStack(alignment: .leading, spacing: 6) {
-                Eyebrow(text: "Photos & videos")
-                Text("Sift").font(Theme.display(40))
-                Text("Clear out duplicates and make bulky videos smaller. Nothing is deleted unless you choose to.")
-                    .foregroundStyle(Theme.ink2)
+                Eyebrow(text: sourceName)
+                Text(jobTitle).font(Theme.display(34))
+                Text(jobDetail).foregroundStyle(Theme.ink2)
             }
         }
     }
 
-    private var buttonTitle: String {
+    private var sourceName: String {
+        switch model.source {
+        case .photos: "Apple Photos"
+        case .folders: "Folders on this Mac"
+        case .google: "Google Photos"
+        }
+    }
+
+    private var jobTitle: String {
         switch model.job {
+        case .photos: "Duplicate photos"
+        case .videoDuplicates: "Duplicate videos"
+        case .videoCompression: "Make videos smaller"
+        }
+    }
+
+    private var jobDetail: String {
+        switch model.job {
+        case .photos: "Copies and similar shots, to compare side by side and clear out."
+        case .videoDuplicates: "Copies, re-saved versions and trimmed clips of the same video."
+        case .videoCompression: "Smaller HEVC copies of bulky videos, with their dates, places and cameras."
+        }
+    }
+
+    private var buttonTitle: String {
+        if model.source == .google { return model.googleSignedIn ? "Pick Photos in Google…" : "Sign In First" }
+        return switch model.job {
         case .photos: "Scan Photos"
         case .videoDuplicates: "Scan Videos"
         case .videoCompression: "Find Videos to Shrink"
@@ -88,7 +109,7 @@ struct StartView: View {
             Text(model.job == .photos ? model.strictness.photoSummary : model.strictness.videoSummary)
                 .foregroundStyle(Theme.muted)
                 .fixedSize(horizontal: false, vertical: true)
-            if model.job == .videoDuplicates {
+            if model.job == .videoDuplicates && model.source == .photos {
                 Text("Videos stored only in iCloud are compared by their preview and length, which finds copies but not trimmed clips.")
                     .font(.callout)
                     .foregroundStyle(Theme.muted)
@@ -105,7 +126,9 @@ struct StartView: View {
             ForEach(Array([
                 "Sift finds videos stored in older, bulkier formats, or at higher bitrates than they need.",
                 "You choose which to shrink, at the same resolution or capped at 1080p.",
-                "The copies go into Photos next to the originals, with the same date, place, favourite and albums.",
+                model.source == .folders
+                    ? "Each copy is saved next to its original, named “<name> - sift compression”, with the same date and place."
+                    : "The copies go into Photos next to the originals, with the same date, place, favourite and albums.",
                 "When you're happy with them, Sift can delete the originals, after asking you twice.",
             ].enumerated()), id: \.offset) { k, line in
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -119,36 +142,100 @@ struct StartView: View {
     }
 }
 
-/// One of the two things Sift does, as a card to pick.
-struct JobCard: View {
+/// The folders Sift looks through, with Add and Remove.
+struct FolderSourceCard: View {
     @EnvironmentObject var model: AppModel
-    let job: AppModel.Job
-    let symbol: String
-    let title: String
-    let detail: String
 
     var body: some View {
-        let chosen = model.job == job
-        Button { model.job = job } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(chosen ? Theme.accent : Theme.muted)
-                    .frame(width: 34, height: 34)
-                    .background(RoundedRectangle(cornerRadius: 9).fill(chosen ? Theme.accentSoft : Theme.surface3))
-                Text(title).font(Theme.display(16, bold: false)).foregroundStyle(Theme.ink)
-                Text(detail).font(.callout).foregroundStyle(Theme.muted)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Folders to look through").font(Theme.display(17, bold: false))
+                Spacer()
+                Button("Add Folder…") { model.addFolder() }.buttonStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-            .background(RoundedRectangle(cornerRadius: Theme.radiusLarge).fill(chosen ? Theme.accentSoft : Theme.surface))
-            .overlay(RoundedRectangle(cornerRadius: Theme.radiusLarge)
-                .strokeBorder(chosen ? Theme.accent.opacity(0.55) : Theme.border, lineWidth: chosen ? 1.5 : 1))
-            .contentShape(Rectangle())
+            if model.folderList.isEmpty {
+                Text("Add folders of photos and videos: on this Mac, an external drive, a Google Takeout export, "
+                     + "or a synced Google Drive or Dropbox folder. Folders inside them are included.")
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(model.folderList, id: \.self) { url in
+                        HStack(spacing: 10) {
+                            Image(systemName: "folder").foregroundStyle(Theme.muted)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(url.lastPathComponent)
+                                Text(url.deletingLastPathComponent().path(percentEncoded: false))
+                                    .font(.caption).foregroundStyle(Theme.muted).lineLimit(1).truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button { model.removeFolder(url) } label: { Image(systemName: "minus.circle") }
+                                .buttonStyle(.borderless)
+                                .help("Stop looking in this folder (nothing in it is changed)")
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 10)
+                        if url != model.folderList.last { Divider() }
+                    }
+                }
+                .background(RoundedRectangle(cornerRadius: Theme.radius).fill(Theme.bg2))
+                Text("Anything you delete is moved to the Bin, so you can put it back.")
+                    .font(.callout).foregroundStyle(Theme.muted)
+            }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
+    }
+}
+
+/// Signing in to Google, and how picking works.
+struct GoogleSourceCard: View {
+    @EnvironmentObject var model: AppModel
+    @State private var signingIn = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Your Google account").font(Theme.display(17, bold: false))
+            if !model.google.isConfigured {
+                Text("Google sign-in hasn't been set up in this copy of Sift. See “Google Photos” in mac/README.md.")
+                    .foregroundStyle(Theme.muted)
+            } else if model.googleSignedIn {
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.checkmark").foregroundStyle(Theme.success)
+                    Text(model.googleEmail ?? "Signed in")
+                    Spacer()
+                    Button("Sign Out") { model.signOutOfGoogle() }.buttonStyle(.secondary)
+                }
+            } else {
+                HStack {
+                    Text("Sign in so Sift can see the photos you pick.").foregroundStyle(Theme.ink2)
+                    Spacer()
+                    Button(signingIn ? "Signing In…" : "Sign In with Google") {
+                        signingIn = true
+                        Task { await model.signInToGoogle(); signingIn = false }
+                    }
+                    .buttonStyle(.primary)
+                    .disabled(signingIn)
+                }
+            }
+            if let error = model.googleError {
+                Text(error).font(.callout).foregroundStyle(Theme.danger)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("How it works").font(.headline)
+                Text("Google only lets apps see the photos you pick in Google's own window, up to 2,000 at a time, and "
+                     + "never lets apps delete from Google Photos. So Sift opens Google Photos in your browser, you pick "
+                     + "the photos to check (a day, a trip, an album), and Sift shows you the duplicates. You then delete "
+                     + "them in Google Photos, with a list Sift copies for you.")
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Only photos are compared; videos picked are skipped.")
+                    .font(.callout).foregroundStyle(Theme.muted)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
     }
 }
 

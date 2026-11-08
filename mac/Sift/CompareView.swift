@@ -56,11 +56,13 @@ struct CompareView: View {
                         .keyboardShortcut(.rightArrow, modifiers: [])
                         .disabled(k >= model.sets.count - 1)
                         .help("Next set")
-                    Button(markedHere.isEmpty ? "Delete" : "Delete \(markedHere.count)…") {
-                        model.requestDelete(Set(markedHere))
+                    if model.provider.canDelete {
+                        Button(markedHere.isEmpty ? "Delete" : "Delete \(markedHere.count)…") {
+                            model.requestDelete(Set(markedHere))
+                        }
+                        .buttonStyle(.danger)
+                        .disabled(markedHere.isEmpty || model.deleting)
                     }
-                    .buttonStyle(.danger)
-                    .disabled(markedHere.isEmpty || model.deleting)
                     Button("Done") { dismiss() }
                         .buttonStyle(.primary)
                         .keyboardShortcut(.cancelAction)
@@ -237,7 +239,7 @@ struct ComparePanel: View {
             guard item.duration == 0 else { return }       // videos load in their player
             loading = true
             full = nil
-            let (image, ok) = await model.library.fullImage(item.id) { downloaded = $0 }
+            let (image, ok) = await model.provider.fullImage(item.id) { downloaded = $0 }
             full = image
             isFullQuality = ok
             loading = false
@@ -257,6 +259,7 @@ struct ComparePanel: View {
 
 /// A video in the compare view, played from Photos (downloading from iCloud if need be).
 struct VideoPanel: View {
+    @EnvironmentObject var model: AppModel
     let id: String
     @State private var player: AVPlayer?
     @State private var failed = false
@@ -273,19 +276,7 @@ struct VideoPanel: View {
             }
         }
         .task(id: id) {
-            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
-                failed = true
-                return
-            }
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .automatic
-            let item: AVPlayerItem? = await withCheckedContinuation { continuation in
-                PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { item, _ in
-                    continuation.resume(returning: item)
-                }
-            }
-            if let item {
+            if let item = await model.provider.playerItem(id) {
                 let made = AVPlayer(playerItem: item)
                 made.isMuted = true
                 player = made

@@ -89,11 +89,26 @@ struct ResultsView: View {
                         .foregroundStyle(Theme.muted)
                         .monospacedDigit()
                 }
-                Button(model.marked.isEmpty ? "Delete" : "Delete \(model.marked.count.formatted())…") {
-                    model.requestDelete(model.marked)
+                Button(model.marked.isEmpty ? "Save…" : "Save \(model.marked.count.formatted())…") {
+                    model.saving = SaveRequest(ids: Array(model.marked))
                 }
-                .buttonStyle(.danger)
-                .disabled(model.marked.isEmpty || model.deleting)
+                .buttonStyle(.secondary)
+                .disabled(model.marked.isEmpty)
+                .help("Add the marked items to an album in Photos, or copy them to a folder")
+                if model.provider.canDelete {
+                    Button(model.marked.isEmpty ? "Delete" : "Delete \(model.marked.count.formatted())…") {
+                        model.requestDelete(model.marked)
+                    }
+                    .buttonStyle(.danger)
+                    .disabled(model.marked.isEmpty || model.deleting)
+                } else {
+                    Button("Copy List") { model.copyMarkedList() }
+                        .buttonStyle(.secondary)
+                        .disabled(model.marked.isEmpty)
+                        .help("Copy the marked photos' names and dates, to find them in Google Photos")
+                    Button("Open Google Photos") { model.openGooglePhotos() }
+                        .buttonStyle(.primary)
+                }
             }
         }
         .padding(.horizontal, 24)
@@ -120,12 +135,25 @@ struct SetRow: View {
                 Button("Compare", systemImage: "arrow.up.left.and.arrow.down.right", action: compare)
                     .buttonStyle(SecondaryButtonStyle(tint: Theme.accentText))
                 Button("Keep All") { model.keepAll(set) }.buttonStyle(.secondary)
+                Button("Save Set…") {
+                    model.saving = SaveRequest(ids: set.members.map { model.items[$0.index].id })
+                }
+                .buttonStyle(.secondary)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 240), spacing: 12)], alignment: .leading, spacing: 12) {
                 ForEach(set.members, id: \.index) { member in
                     let item = model.items[member.index]
                     ItemTile(item: item, member: member, marked: model.marked.contains(item.id))
                         .onTapGesture { model.toggle(item.id) }
+                        .contextMenu {
+                            Button(model.marked.contains(item.id) ? "Keep" : "Mark for Deleting") { model.toggle(item.id) }
+                            Button("Save to Album or Folder…") { model.saving = SaveRequest(ids: [item.id]) }
+                            if model.source == .folders {
+                                Button("Show in Finder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.id)])
+                                }
+                            }
+                        }
                 }
             }
         }
@@ -238,7 +266,7 @@ struct Thumbnail: View {
     let side: CGFloat
     var fit = false
     @State private var image: NSImage?
-    @State private var request: PHImageRequestID?
+    @State private var cancel: (() -> Void)?
 
     var body: some View {
         ZStack {
@@ -252,12 +280,13 @@ struct Thumbnail: View {
             }
         }
         .onAppear {
-            request = model.library.thumbnail(id, side: side * 2) { found in
+            cancel = model.provider.thumbnail(id, side: side) { found in
                 if let found { image = found }
             }
         }
         .onDisappear {
-            if let request { model.library.cancel(request) }
+            cancel?()
+            cancel = nil
         }
     }
 }

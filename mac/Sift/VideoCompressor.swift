@@ -86,6 +86,30 @@ final class VideoCompressor: @unchecked Sendable {
         return Made(photosID: newID, size: size, file: file)
     }
 
+    /// Makes a smaller copy of a video file and saves it next to the original, named
+    /// "<name> - sift compression.<ext>".
+    func compressFile(_ source: URL, mode: CompressionMode, progress: @escaping @Sendable (Double) -> Void) async throws -> Made {
+        let asset = AVURLAsset(url: source)
+        let name = Self.copyName(source.lastPathComponent)
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let url = workDir.appendingPathComponent(name)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        try await encode(asset, to: url, mode: mode) { progress($0 * 0.95) }
+
+        let copy = AVURLAsset(url: url)
+        let (inLength, outLength) = (try await asset.load(.duration).seconds, try await copy.load(.duration).seconds)
+        if abs(inLength - outLength) > max(0.6, 0.01 * inLength) { throw CompressionError.wrongLength }
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        let sourceSize = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if sourceSize > 0, Double(size) > 0.85 * Double(sourceSize) { throw CompressionError.notSmaller }
+
+        let destination = PhotoLibrary.unused(source.deletingLastPathComponent().appendingPathComponent(name))
+        try FileManager.default.copyItem(at: url, to: destination)
+        progress(1)
+        return Made(photosID: nil, size: size, file: destination)
+    }
+
     // MARK: getting the original
 
     private func originalAsset(_ original: PHAsset, progress: @escaping @Sendable (Double) -> Void) async -> AVAsset? {

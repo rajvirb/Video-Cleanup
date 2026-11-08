@@ -8,6 +8,10 @@ import SwiftUI
 final class AppModel: ObservableObject {
     enum Stage { case welcome, noAccess, start, scanning, results, videos, compressing, compressed }
     enum Job: Hashable { case photos, videoDuplicates, videoCompression }
+    /// Where the photos and videos come from.
+    enum Source: Hashable { case photos, folders, google }
+    /// What's chosen in the sidebar: a tool for a source, or the Support page.
+    enum SidebarItem: Hashable { case tool(Source, Job), support }
     enum VideoSort: String, CaseIterable, Identifiable {
         case saving = "Most space saved first", size = "Largest first", length = "Longest first"
         case newest = "Newest first", oldest = "Oldest first", name = "Name"
@@ -21,9 +25,19 @@ final class AppModel: ObservableObject {
     }
 
     let library = PhotoLibrary()
+    let folders = FolderLibrary()
+    let google = GoogleLibrary()
 
     @Published var stage: Stage = .welcome
     @Published var job: Job = .photos
+    @Published var source: Source = .photos
+    @Published var sidebar: SidebarItem? = .tool(.photos, .photos)
+    @Published var photosAccess = true
+    @Published var folderList: [URL] = []
+    @Published var googleSignedIn = false
+    @Published var googleEmail: String?
+    @Published var googleError: String?
+    @Published var saving: SaveRequest?
     // what to scan
     @Published var totalPhotos = 0
     @Published var totalVideos = 0
@@ -74,6 +88,29 @@ final class AppModel: ObservableObject {
 
     init() {
         restoreComparisonFolder()
+        folderList = folders.folders
+        googleSignedIn = google.isSignedIn
+        googleEmail = google.email
+    }
+
+    /// The source the screens are showing.
+    var provider: MediaProvider {
+        switch source {
+        case .photos: library
+        case .folders: folders
+        case .google: google
+        }
+    }
+
+    /// Switches to a tool from the sidebar (not while a scan or compression is running).
+    func select(_ item: SidebarItem?) {
+        guard let item, stage != .scanning, stage != .compressing else { return }
+        sidebar = item
+        if case .tool(let newSource, let newJob) = item {
+            source = newSource
+            job = newJob
+            if stage != .welcome { stage = .start }
+        }
     }
 
     // MARK: getting started
@@ -82,9 +119,11 @@ final class AppModel: ObservableObject {
         var status = library.status
         if status == .notDetermined { status = await library.requestAccess() }
         guard status == .authorized || status == .limited else {
-            stage = .noAccess
+            photosAccess = false            // folders and Google Photos still work
+            stage = .start
             return
         }
+        photosAccess = true
         totalPhotos = library.count(.image)
         totalVideos = library.count(.video)
         stage = .start
@@ -115,7 +154,13 @@ final class AppModel: ObservableObject {
         return ids
     }
 
-    var canScan: Bool { scope == .everything || !chosenIDs.isEmpty }
+    var canScan: Bool {
+        switch source {
+        case .photos: photosAccess && (scope == .everything || !chosenIDs.isEmpty)
+        case .folders: !folderList.isEmpty
+        case .google: google.isConfigured && googleSignedIn
+        }
+    }
 
     // MARK: scanning
 
@@ -152,11 +197,196 @@ final class AppModel: ObservableObject {
     }
 
     func startJob() {
-        switch job {
-        case .photos: scan()
-        case .videoDuplicates: scanVideos()
-        case .videoCompression: findVideos()
+        switch (source, job) {
+        case (.photos, .photos): scan()
+        case (.photos, .videoDuplicates): scanVideos()
+        case (.photos, .videoCompression): findVideos()
+        case (.folders, .photos): scanFolderPhotos()
+        case (.folders, .videoDuplicates): scanFolderVideos()
+        case (.folders, .videoCompression): findFolderVideos()
+        case (.google, _): scanGoogle()
         }
+    }
+
+    // MARK: folders on this Mac
+
+    func addFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Choose folders of photos and videos for Sift to look through."
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls { folders.add(url) }
+        folderList = folders.folders
+    }
+
+    func removeFolder(_ url: URL) {
+        folders.remove(url)
+        folderList = folders.folders
+    }
+
+    func scanFolderPhotos() {
+        stage = .scanning
+        message = nil
+        let folders = self.folders
+        let strictness = self.strictness
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Reading and fingerprinting your photos…")
+            let items = folders.photoItems { done, total in
+                Task { @MainActor in self?.progress(done, total, "Fingerprinting") }
+            }
+            if Task.isCancelled { return }
+            await self?.step("Looking for duplicates and similar shots…")
+            let sets = Grouping.buildSets(items, matches: Matcher.findPhotoMatches(items, strictness: strictness))
+            await self?.finish(items: items, sets: sets)
+        }
+    }
+
+    func scanFolderVideos() {
+        stage = .scanning
+        message = nil
+        let folders = self.folders
+        let strictness = self.strictness
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Reading your videos…")
+            let videos = await folders.videoItems { done, total in
+                Task { @MainActor in self?.progress(done, total, "Reading") }
+            }
+            if Task.isCancelled { return }
+            await self?.step("Fingerprinting \(Format.plural(videos.count, "video"))…")
+            let prints = await folders.videoFingerprints(videos.map(\.id)) { done, total in
+                Task { @MainActor in self?.progress(done, total, "Fingerprinting") }
+            }
+            if Task.isCancelled { return }
+            await self?.step("Looking for duplicate videos…")
+            let clips = videos.map { v in
+                VideoClip(id: v.id, size: v.size, duration: v.duration, width: v.width, height: v.height,
+                          frames: prints[v.id]?.frames ?? [])
+            }
+            let sets = VideoMatcher.buildSets(clips, matches: VideoMatcher.findMatches(clips, strictness: strictness))
+            let items = videos.map { v in
+                PhotoItem(id: v.id, name: v.name, date: v.date, width: v.width, height: v.height, size: v.size, duration: v.duration)
+            }
+            await self?.finish(items: items, sets: sets)
+        }
+    }
+
+    func findFolderVideos() {
+        stage = .scanning
+        message = nil
+        originalsDeleted = false
+        let folders = self.folders
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Reading your videos…")
+            let videos = await folders.videoItems { done, total in
+                Task { @MainActor in self?.progress(done, total, "Reading") }
+            }
+            let candidates = videos.compactMap { video -> VideoCandidate? in
+                let same = Compression.plan(video, mode: .sameResolution)
+                let hd = Compression.plan(video, mode: .cap1080p)
+                return same == nil && hd == nil ? nil : VideoCandidate(video: video, same: same, hd: hd)
+            }
+            if Task.isCancelled { return }
+            await self?.showCandidates(candidates)
+        }
+    }
+
+    // MARK: Google Photos
+
+    func signInToGoogle() async {
+        googleError = nil
+        do {
+            try await google.signIn()
+        } catch {
+            googleError = error.localizedDescription
+        }
+        googleSignedIn = google.isSignedIn
+        googleEmail = google.email
+    }
+
+    func signOutOfGoogle() {
+        google.signOut()
+        googleSignedIn = false
+        googleEmail = nil
+    }
+
+    /// Opens Google Photos' Picker, then compares the photos picked there.
+    func scanGoogle() {
+        stage = .scanning
+        message = nil
+        googleError = nil
+        let google = self.google
+        let strictness = self.strictness
+        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.step("Opening Google Photos…")
+            do {
+                let picks = try await google.pick { status in Task { @MainActor in self?.stepTitle = status } }
+                if Task.isCancelled { return }
+                await self?.step("Fingerprinting \(Format.plural(picks.filter { !$0.isVideo }.count, "photo"))…")
+                let items = await google.items(for: picks) { done, total in
+                    Task { @MainActor in self?.progress(done, total, "Fingerprinting") }
+                }
+                await self?.step("Looking for duplicates and similar shots…")
+                let sets = Grouping.buildSets(items, matches: Matcher.findPhotoMatches(items, strictness: strictness))
+                await self?.finish(items: items, sets: sets)
+            } catch {
+                await self?.googleFailed(error)
+            }
+        }
+    }
+
+    private func googleFailed(_ error: Error) {
+        googleError = error.localizedDescription
+        googleSignedIn = google.isSignedIn
+        stage = .start
+    }
+
+    /// For Google Photos, where Sift can't delete: the marked items' names and dates, to
+    /// find them in Google Photos.
+    func copyMarkedList() {
+        let lines = items.filter { marked.contains($0.id) }.map { item in
+            [item.name, item.date?.formatted(date: .abbreviated, time: .shortened)].compactMap { $0 }.joined(separator: " — ")
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+        message = "Copied a list of \(Format.plural(lines.count, "photo")) to find and delete in Google Photos."
+    }
+
+    func openGooglePhotos() {
+        NSWorkspace.shared.open(URL(string: "https://photos.google.com")!)
+    }
+
+    // MARK: saving to an album or folder
+
+    func save(_ ids: [String], album: String?, photosFolder: String, macFolder: URL?) async {
+        do {
+            var files: [URL] = []
+            switch source {
+            case .photos:
+                if let album { try await library.addToAlbum(ids, album: album, folder: photosFolder) }
+                if let macFolder { for id in ids { _ = try await library.exportOriginal(id, to: macFolder) } }
+            case .folders:
+                files = ids.map { URL(fileURLWithPath: $0) }
+                if let album { try await library.importToAlbum(files, album: album, folder: photosFolder) }
+                if let macFolder {
+                    for file in files {
+                        try FileManager.default.copyItem(at: file, to: PhotoLibrary.unused(macFolder.appendingPathComponent(file.lastPathComponent)))
+                    }
+                }
+            case .google:
+                files = try await google.download(ids, to: macFolder ?? FileManager.default.temporaryDirectory)
+                if let album { try await library.importToAlbum(files, album: album, folder: photosFolder) }
+            }
+            var places: [String] = []
+            if let album { places.append("the album “\(album)” in Photos") }
+            if let macFolder { places.append("“\(macFolder.lastPathComponent)”") }
+            message = "Saved \(Format.plural(ids.count, noun)) to \(places.joined(separator: " and "))."
+        } catch {
+            message = "Couldn't save them: \(error.localizedDescription)"
+        }
+        saving = nil
     }
 
     /// Finds duplicate and trimmed videos: fingerprints frames through each one (and
@@ -284,15 +514,17 @@ final class AppModel: ObservableObject {
         deleting = true
         defer { deleting = false }
         let size = items.filter { ids.contains($0.id) }.reduce(Int64(0)) { $0 + $1.size }
-        guard await library.delete(Array(ids)) else { return }
+        guard await provider.delete(Array(ids)) else { return }
         marked.subtract(ids)
         sets = sets.compactMap { set -> DuplicateSet? in
             let left = set.members.filter { !ids.contains(items[$0.index].id) }
             return left.count > 1 ? DuplicateSet(members: left) : nil   // sets of one are done
         }
         if let open = comparing, open >= sets.count { comparing = sets.isEmpty ? nil : sets.count - 1 }
-        message = "Deleted \(Format.plural(ids.count, noun)) (\(Format.size(size))). They're in Recently Deleted "
-            + "in Photos for 30 days. To free the space now, empty Recently Deleted."
+        message = source == .folders
+            ? "Moved \(Format.plural(ids.count, noun)) (\(Format.size(size))) to the Bin. To free the space, empty the Bin."
+            : "Deleted \(Format.plural(ids.count, noun)) (\(Format.size(size))). They're in Recently Deleted "
+                + "in Photos for 30 days. To free the space now, empty Recently Deleted."
     }
 
     // MARK: videos
@@ -341,7 +573,7 @@ final class AppModel: ObservableObject {
     }
 
     var canCompress: Bool {
-        !videosToCompress.isEmpty && (importToPhotos || (saveToFolder && comparisonFolder != nil))
+        !videosToCompress.isEmpty && (source == .folders || importToPhotos || (saveToFolder && comparisonFolder != nil))
     }
 
     /// Asks where to save the smaller copies (next to copies of the originals), and remembers it.
@@ -383,10 +615,11 @@ final class AppModel: ObservableObject {
     func compressVideos() {
         let todo = sortedCandidates.filter { chosenVideos.contains($0.id) && $0.plan(compressionMode) != nil }
         guard !todo.isEmpty, canCompress else { return }
-        let toPhotos = importToPhotos
-        let folder = saveToFolder ? comparisonFolder : nil
+        let fromFolders = source == .folders
+        let toPhotos = importToPhotos && !fromFolders
+        let folder = fromFolders ? nil : (saveToFolder ? comparisonFolder : nil)
         let library = self.library
-        lastFolderUsed = folder
+        lastFolderUsed = fromFolders ? todo.first.map { URL(fileURLWithPath: $0.id).deletingLastPathComponent() } : folder
         stage = .compressing
         compressResults = []
         compressTotal = todo.count
@@ -404,10 +637,13 @@ final class AppModel: ObservableObject {
                 self.compressName = candidate.video.name
                 self.compressFraction = 0
                 do {
-                    let made = try await compressor.compress(candidate.id, mode: mode, toPhotos: toPhotos, folder: folder,
-                                                             library: library) { value in
+                    let report: @Sendable (Double) -> Void = { value in
                         Task { @MainActor [weak self] in self?.updateCompressProgress(k, of: todo.count, value) }
                     }
+                    let made = fromFolders
+                        ? try await compressor.compressFile(URL(fileURLWithPath: candidate.id), mode: mode, progress: report)
+                        : try await compressor.compress(candidate.id, mode: mode, toPhotos: toPhotos, folder: folder,
+                                                        library: library, progress: report)
                     self.compressResults.append(CompressResult(video: candidate.video, newID: made.photosID,
                                                                newSize: made.size, file: made.file, problem: nil))
                 } catch is CancellationError {
@@ -437,8 +673,11 @@ final class AppModel: ObservableObject {
     }
 
     var compressedOK: [CompressResult] { compressResults.filter { $0.newSize != nil } }
-    /// The ones whose copy is in Photos: only their originals can be deleted from here.
-    var compressedInPhotos: [CompressResult] { compressResults.filter { $0.newID != nil } }
+    /// The ones whose copy is safely made (in Photos, or next to a file original): only
+    /// their originals can be deleted from here.
+    var compressedInPhotos: [CompressResult] {
+        compressResults.filter { $0.newID != nil || (source == .folders && $0.file != nil) }
+    }
     var compressedSaving: Int64 { compressedOK.reduce(0) { $0 + max(0, $1.video.size - ($1.newSize ?? 0)) } }
 
     /// Shows the summary before deleting the originals of the videos that now have a smaller copy.
@@ -454,10 +693,12 @@ final class AppModel: ObservableObject {
     private func deleteOriginals(_ ids: Set<String>) async {
         deleting = true
         defer { deleting = false }
-        guard await library.delete(Array(ids)) else { return }
+        guard await provider.delete(Array(ids)) else { return }
         originalsDeleted = true
-        message = "Deleted \(Format.plural(ids.count, "original")). They're in Recently Deleted in Photos for 30 days. "
-            + "To free the space now, empty Recently Deleted."
+        message = source == .folders
+            ? "Moved \(Format.plural(ids.count, "original")) to the Bin. To free the space, empty the Bin."
+            : "Deleted \(Format.plural(ids.count, "original")). They're in Recently Deleted in Photos for 30 days. "
+                + "To free the space now, empty Recently Deleted."
     }
 
     func openPhotos() {

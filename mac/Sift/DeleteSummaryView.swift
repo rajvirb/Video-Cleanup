@@ -23,10 +23,10 @@ struct DeleteSummaryView: View {
                 Eyebrow(text: "Before deleting")
                 Text("Delete \(Format.plural(count, noun.0, noun.1))?").font(Theme.display(26))
                 if size > 0 {
-                    Text("This frees \(Format.size(size)) once they leave Recently Deleted.").foregroundStyle(Theme.ink2)
+                    Text(model.source == .folders ? "This frees \(Format.size(size)) once you empty the Bin."
+                         : "This frees \(Format.size(size)) once they leave Recently Deleted.").foregroundStyle(Theme.ink2)
                 }
-                Text("macOS will ask you to confirm next. Deleted items stay in Photos' Recently Deleted album "
-                     + "for 30 days, so you can still get them back.")
+                Text(model.provider.deleteNote)
                     .foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
