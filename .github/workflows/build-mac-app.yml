@@ -43,3 +43,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" "dist/Sift.zip" --title "Sift $GITHUB_REF_NAME" --generate-notes
+
+  # The native Mac app (mac/): SiftCore's tests, then an unsigned build of Sift.app.
+  native:
+    name: Native app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test SiftCore
+        run: |
+          set -o pipefail
+          swift test --package-path mac/SiftCore 2>&1 | tee native.log
+      - name: Build the app
+        run: |
+          set -o pipefail
+          brew install xcodegen
+          cd mac && xcodegen generate --quiet
+          xcodebuild -project Sift.xcodeproj -scheme Sift -configuration Debug -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee -a ../native.log | grep -E "error|warning: .*Sift/|BUILD" || true
+          grep -q "BUILD SUCCEEDED" ../native.log
+      - name: Show why it failed
+        if: failure()
+        run: |
+          echo "Xcode $(xcodebuild -version | head -1)"
+          msg=$(grep -E "error:|failed|FAILED|Executed .* tests" native.log | grep -v "^ *$" | sort -u | head -n 40 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Native build failed::$msg"

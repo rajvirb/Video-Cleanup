@@ -1,0 +1,53 @@
+# The Xcode project for Sift, the native Mac app. Generate it with ./open.sh (which runs
+# XcodeGen and opens Xcode); Sift.xcodeproj itself isn't kept in git.
+name: Sift
+options:
+  bundleIdPrefix: com.rajvirb
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  SiftCore:
+    path: SiftCore
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Sift:
+    type: application
+    platform: macOS
+    sources:
+      - Sift
+    dependencies:
+      - package: SiftCore
+    info:
+      path: Sift/Info.plist
+      properties:
+        CFBundleDisplayName: Sift
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.photography
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSPhotoLibraryUsageDescription: >-
+          Sift looks through your photos to find duplicates and similar shots, and deletes
+          the ones you choose. Nothing leaves your Mac.
+    entitlements:
+      path: Sift/Sift.entitlements
+      properties:
+        # the App Store requires the sandbox; this is the only door Sift needs through it
+        com.apple.security.app-sandbox: true
+        com.apple.security.personal-information.photos-library: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rajvirb.siftapp
+        PRODUCT_NAME: Sift
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        # "Sign to Run Locally": runs on this Mac with no Apple account. Pick your team in
+        # Signing & Capabilities to use your Apple ID, and for the App Store.
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        COMBINE_HIDPI_IMAGES: YES

@@ -2,6 +2,7 @@
 
   uv run --with pillow tools/make_icon.py
 """
+import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
@@ -67,3 +68,15 @@ if __name__ == "__main__":
     img.resize((256, 256), Image.LANCZOS).save(OUT / "icon.png")
     img.save(OUT / "icon.icns", sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)])
     print("wrote", OUT / "icon.png", "and", OUT / "icon.icns")
+    # the native app's icon set (mac/Sift/Assets.xcassets)
+    iconset = OUT.parent / "mac" / "Sift" / "Assets.xcassets" / "AppIcon.appiconset"
+    iconset.mkdir(parents=True, exist_ok=True)
+    images = []
+    for points in (16, 32, 128, 256, 512):
+        for scale in (1, 2):
+            name = f"icon_{points}x{points}@{scale}x.png"
+            img.resize((points * scale, points * scale), Image.LANCZOS).save(iconset / name)
+            images.append({"idiom": "mac", "size": f"{points}x{points}", "scale": f"{scale}x", "filename": name})
+    (iconset / "Contents.json").write_text(json.dumps({"images": images, "info": {"version": 1, "author": "xcode"}}, indent=2))
+    (iconset.parent / "Contents.json").write_text(json.dumps({"info": {"version": 1, "author": "xcode"}}, indent=2))
+    print("wrote", iconset)
