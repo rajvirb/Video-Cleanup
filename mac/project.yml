@@ -65,7 +65,11 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         DEVELOPMENT_TEAM: ""
         COMBINE_HIDPI_IMAGES: YES
-        GOOGLE_CLIENT_ID: ""
+    # your own settings, such as GOOGLE_CLIENT_ID; open.sh makes it, and it isn't kept in git
+    configFiles:
+      Debug: Local.xcconfig
+      Release: Local.xcconfig
+      AppStore: Local.xcconfig
       configs:
         AppStore:
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: APP_STORE

@@ -58,7 +58,7 @@ jobs:
         run: |
           set -o pipefail
           brew install xcodegen
-          cd mac && xcodegen generate --quiet
+          cd mac && touch Local.xcconfig && xcodegen generate --quiet
           xcodebuild -project Sift.xcodeproj -scheme Sift -configuration Debug -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO build 2>&1 | tee -a ../native.log | grep -E "error|warning: .*Sift/|BUILD" || true
           grep -q "BUILD SUCCEEDED" ../native.log

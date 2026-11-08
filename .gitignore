@@ -9,3 +9,4 @@ mac/Sift/Sift.entitlements
 mac/SiftCore/.build/
 mac/build/
 xcuserdata/
+mac/Local.xcconfig

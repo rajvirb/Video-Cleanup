@@ -11,5 +11,13 @@ if ! command -v xcodegen >/dev/null; then
     echo "Installing XcodeGen…"
     brew install xcodegen
 fi
+if [ ! -f Local.xcconfig ]; then
+    cat > Local.xcconfig <<'CONFIG'
+// Your own settings for Sift. Not kept in git.
+// To turn on Google Photos, put your OAuth client ID after the = (see README.md), then
+// run ./mac/open.sh again.
+GOOGLE_CLIENT_ID =
+CONFIG
+fi
 xcodegen generate --quiet
 open Sift.xcodeproj
